@@ -224,6 +224,7 @@ def main():
         args.model, torch_dtype=torch.float16 if on_gpu else torch.float32, quantization_config=quant,
         device_map={"": local_rank} if on_gpu else "cpu", attn_implementation="sdpa")
     model.config.use_cache = False
+    mem_load_gb = torch.cuda.memory_allocated(local_rank) / 2**30 if on_gpu else 0.0
     if quant is not None:
         model = prepare_model_for_kbit_training(
             model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
@@ -300,7 +301,15 @@ def main():
     result = trainer.train(resume_from_checkpoint=resume)
     if trainer.is_world_process_zero():
         # speed numbers for the pipeline's training-time estimate
-        (Path(args.out) / "train_metrics.json").write_text(json.dumps(result.metrics, indent=1))
+        metrics = dict(result.metrics)
+        if on_gpu:
+            metrics.update(
+                gpu_mem_after_load_gb=round(mem_load_gb, 2),
+                gpu_mem_peak_gb=round(torch.cuda.max_memory_allocated(local_rank) / 2**30, 2),
+                gpu_mem_total_gb=round(torch.cuda.get_device_properties(local_rank).total_memory / 2**30, 2),
+                longest_example_tokens=max(len(e["input_ids"]) for e in train_ds.examples),
+                max_len=args.max_len, quantize_4bit=not args.no_4bit, batch_size=args.batch_size)
+        (Path(args.out) / "train_metrics.json").write_text(json.dumps(metrics, indent=1))
 
     if budget is not None and budget.hit:
         if trainer.is_world_process_zero():

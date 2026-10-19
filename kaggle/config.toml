@@ -15,7 +15,8 @@ base = "Qwen/Qwen3-4B-Instruct-2507"
 out = "outputs/qwen3-4b-tatqa"
 epochs = 2
 lr = 2e-4
-batch_size = 2          # per GPU; use 1 (with grad_accum 16) if you hit out-of-memory
+quantize_4bit = true    # true = QLoRA (least memory); false = LoRA on 16-bit weights (more memory, often faster)
+batch_size = 2          # per GPU; keep batch_size x grad_accum x 2 GPUs = 32
 grad_accum = 8
 max_len = 2048
 save_steps = 100
@@ -25,6 +26,32 @@ hub_repo = ""           # e.g. "your-hf-username/qwen3-4b-tatqa" -> checkpoints 
 [dryrun]
 samples = 64
 val_samples = 16
+
+# "speedtest" stage: a short run of each setup below on both GPUs, then a table of speed and memory.
+# Run it with STAGES = "setup,data,speedtest". Each setup keeps the effective batch at 32.
+[[speedtest]]
+name = "qlora_bs2"
+quantize_4bit = true
+batch_size = 2
+grad_accum = 8
+
+[[speedtest]]
+name = "qlora_bs4"
+quantize_4bit = true
+batch_size = 4
+grad_accum = 4
+
+[[speedtest]]
+name = "lora16_bs2"
+quantize_4bit = false
+batch_size = 2
+grad_accum = 8
+
+[[speedtest]]
+name = "lora16_bs4"
+quantize_4bit = false
+batch_size = 4
+grad_accum = 4
 
 [infer]
 backend = "vllm"        # falls back to "hf" automatically if vLLM fails

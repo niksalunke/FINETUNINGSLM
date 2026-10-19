@@ -28,7 +28,7 @@ except ImportError:  # Python < 3.11
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
-ALL_STAGES = ["setup", "data", "llm_smoketest", "dryrun", "train", "merge", "infer", "api", "evaluate"]
+ALL_STAGES = ["setup", "data", "llm_smoketest", "dryrun", "speedtest", "train", "merge", "infer", "api", "evaluate"]
 TRAIN_LIBS = ['transformers>=4.51', 'peft>=0.13', 'accelerate>=1.0', 'bitsandbytes>=0.43', "anthropic", "openai"]
 
 
@@ -101,11 +101,14 @@ class Runner:
             return False
         return True
 
-    def train_args(self, out: str) -> list[str]:
-        t = self.cfg["train"]
-        return ["src/train.py", "--model", self.cfg["model"]["base"], "--data", "data", "--out", out,
+    def train_args(self, out: str, override: dict | None = None) -> list[str]:
+        t = {**self.cfg["train"], **(override or {})}
+        args = ["src/train.py", "--model", self.cfg["model"]["base"], "--data", "data", "--out", out,
                 "--lr", str(t["lr"]), "--batch_size", str(t["batch_size"]), "--grad_accum", str(t["grad_accum"]),
                 "--max_len", str(t["max_len"])]
+        if not t.get("quantize_4bit", True):
+            args.append("--no_4bit")
+        return args
 
     # ------------------------------------------------------------------ stages
     def setup(self):
@@ -147,6 +150,53 @@ class Runner:
                                             "--save_steps", "1000"])
         print(f"DRY RUN OK - training works on this machine ({max(1, self.n_gpus())} GPU)")
         self.estimate_training_time(ROOT / out / "train_metrics.json")
+
+    def speedtest(self):
+        """Short training run of each [[speedtest]] setup; prints speed, memory and the fastest setup that fits."""
+        self.need_gpu()
+        d = self.cfg["dryrun"]
+        n_train = sum(1 for _ in open(ROOT / "data/train.jsonl", encoding="utf-8")) if self.exists("data/train.jsonl") else 0
+        epochs, max_len = self.cfg["train"]["epochs"], self.cfg["train"]["max_len"]
+        rows = []
+        for v in self.cfg.get("speedtest", []):
+            out = f"outputs/speedtest/{v['name']}"
+            print(f"\n----- {v['name']}: 4-bit={v['quantize_4bit']}  batch {v['batch_size']} x accum {v['grad_accum']}")
+            if not self.dry:
+                shutil.rmtree(ROOT / out, ignore_errors=True)
+            override = {k: v[k] for k in ("quantize_4bit", "batch_size", "grad_accum")}
+            try:
+                self.launch(self.train_args(out, override) + [
+                    "--max_train_samples", str(d["samples"]), "--val_samples", str(d["val_samples"]),
+                    "--epochs", "1", "--save_steps", "1000"])
+            except RuntimeError:
+                rows.append({**v, "status": "FAILED (probably out of memory)"})
+                continue
+            if self.dry:
+                continue
+            m = json.loads((ROOT / out / "train_metrics.json").read_text())
+            load, peak, total = m["gpu_mem_after_load_gb"], m["gpu_mem_peak_gb"], m["gpu_mem_total_gb"]
+            # activations grow ~linearly with length: scale the dry run's longest example up to max_len
+            worst = load + (peak - load) * max_len / max(1, m["longest_example_tokens"])
+            speed = m["train_samples_per_second"]
+            rows.append({**v, "status": "ok", "speed": speed, "peak": peak, "worst": worst, "total": total,
+                         "hours": epochs * n_train / speed / 3600, "fits": worst <= total - 1.5})
+        if self.dry or not rows:
+            return
+        print(f"\n{'setup':<12} {'4-bit':<6} {'batch':<6} {'ex/s':>6} {'peak GB':>8} {'worst@' + str(max_len):>11} "
+              f"{'est. hours':>11}  status")
+        for r in rows:
+            if r["status"] != "ok":
+                print(f"{r['name']:<12} {str(r['quantize_4bit']):<6} {r['batch_size']:<6} {'':>6} {'':>8} {'':>11} {'':>11}  {r['status']}")
+                continue
+            note = "fits" if r["fits"] else "too close to the memory limit for the longest examples"
+            print(f"{r['name']:<12} {str(r['quantize_4bit']):<6} {r['batch_size']:<6} {r['speed']:>6.2f} {r['peak']:>8.1f} "
+                  f"{r['worst']:>11.1f} {r['hours']:>11.1f}  {note}")
+        ok = [r for r in rows if r["status"] == "ok" and r["fits"]]
+        if ok:
+            best = max(ok, key=lambda r: r["speed"])
+            print(f"\nfastest setup that fits: {best['name']}  (~{best['hours']:.1f} h for {epochs} epochs)")
+            print(f"to use it, set in kaggle/config.toml [train]: quantize_4bit = {str(best['quantize_4bit']).lower()}, "
+                  f"batch_size = {best['batch_size']}, grad_accum = {best['grad_accum']}")
 
     def estimate_training_time(self, metrics_path: Path):
         if self.dry or not metrics_path.exists():
