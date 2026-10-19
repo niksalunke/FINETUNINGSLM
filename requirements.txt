@@ -1,0 +1,14 @@
+# training (Kaggle 2x T4)
+transformers>=4.51      # Qwen3 support
+peft>=0.13
+accelerate>=1.0
+bitsandbytes>=0.43
+# fast local inference / benchmarking (install after training; falls back to --backend hf)
+vllm
+# flagship API baselines
+anthropic
+openai
+# evaluation
+pandas
+scipy
+matplotlib

@@ -1,0 +1,6 @@
+data/
+outputs/
+results/preds/*.partial.jsonl
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
