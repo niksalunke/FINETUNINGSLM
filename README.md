@@ -45,7 +45,9 @@ not mental arithmetic. Scoring uses the **official TAT-QA scorer** (exact match 
 
 | File | Purpose |
 |---|---|
-| `kaggle_slm_vs_llm.ipynb` | The whole pipeline as a Kaggle notebook (2x T4) |
+| `kaggle_slm_vs_llm.ipynb` | Two-cell Kaggle launcher: pulls this repo, loads Kaggle Secrets, runs the pipeline |
+| `kaggle/config.toml` | **Every setting** (model, training, LLM endpoint and prices, Claude, which stages run) |
+| `kaggle/run_pipeline.py` | Runs the stages in order; each stage skips itself when its work is already done |
 | `src/prepare_data.py` | Downloads TAT-QA and the official scorer; writes `data/{train,val,test}.jsonl` and `few_shot.json` |
 | `src/tatqa_common.py` | Prompt format, gold-target construction, JSON parsing, safe equation execution |
 | `src/train.py` | QLoRA (or LoRA) fine-tune; fp16, SDPA, loss on answer tokens only, DDP on both T4s |
@@ -56,11 +58,19 @@ not mental arithmetic. Scoring uses the **official TAT-QA scorer** (exact match 
 
 ## Run on Kaggle
 
-1. Put this folder on GitHub (and set `REPO_URL` in the notebook) or upload it as a Kaggle Dataset named `finetuningslm`.
-2. Notebook settings: **GPU T4 x2**, Internet on. Add secrets: `ANTHROPIC_API_KEY` (plus any other provider keys) and optionally `HF_TOKEN`.
-3. Run the cells in order. Do the dry run first. For the full training, use **Save & Run All (Commit)**.
+Everything lives in this repo. Kaggle only holds the secrets.
 
-The same steps as commands:
+1. Import `kaggle_slm_vs_llm.ipynb` into Kaggle once. Settings: **GPU T4 x2**, **Internet on**.
+2. Under **Add-ons → Secrets**, add and tick `GITHUB_TOKEN` (read access to this repo). Optionally add `HF_TOKEN`
+   (checkpoint backup), `LLM_API_KEY` (your OpenAI-compatible LLM) and `ANTHROPIC_API_KEY` (Claude baseline).
+3. Quick check: run cell 1, then cell 2 with `STAGES = "setup,data,dryrun"`.
+4. Full run: set `STAGES = ""`, then **Save Version → Save & Run All (Commit)**. If training pauses at its time
+   budget, commit again and it continues.
+
+To change anything, edit `kaggle/config.toml` (or the scripts), push, and re-run. Cell 1 always pulls the latest
+code. Stages: `setup, data, llm_smoketest, dryrun, train, merge, infer, api, evaluate`.
+
+The same steps as plain commands:
 
 ```bash
 python src/prepare_data.py --out data

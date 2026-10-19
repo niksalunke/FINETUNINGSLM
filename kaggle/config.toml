@@ -1,0 +1,51 @@
+# All settings for the Kaggle pipeline. Nothing secret goes here: API keys and tokens live only in
+# Kaggle Secrets (GITHUB_TOKEN, HF_TOKEN, LLM_API_KEY, ANTHROPIC_API_KEY, ...).
+# Change a setting here, push to GitHub, and re-run the notebook: it pulls the new version first.
+
+[pipeline]
+# Stages run in this order when the notebook calls run_pipeline.py with no --stages.
+# Every stage skips itself if its work is already done, so re-running is always safe.
+# "dryrun" is not in this list: run it interactively with  --stages setup,data,dryrun
+stages = ["setup", "data", "llm_smoketest", "train", "merge", "infer", "api", "evaluate"]
+
+[model]
+base = "Qwen/Qwen3-4B-Instruct-2507"
+
+[train]
+out = "outputs/qwen3-4b-tatqa"
+epochs = 2
+lr = 2e-4
+batch_size = 2          # per GPU; use 1 (with grad_accum 16) if you hit out-of-memory
+grad_accum = 8
+max_len = 2048
+save_steps = 100
+max_hours = 10.5        # stop cleanly before Kaggle's 12 h session limit; re-run to continue
+hub_repo = ""           # e.g. "your-hf-username/qwen3-4b-tatqa" -> checkpoints backed up there (needs HF_TOKEN)
+
+[dryrun]
+samples = 64
+val_samples = 16
+
+[infer]
+backend = "vllm"        # falls back to "hf" automatically if vLLM fails
+gpu_hourly_usd = 0.35   # cloud price of one T4, used for the cost comparison
+
+# Your OpenAI-compatible LLM (key: LLM_API_KEY secret)
+[llm]
+enabled = true
+run = "my_llm"
+base_url = "https://inference.dahl.global/v1"
+model = "zai-org/GLM-5.3-Flash"
+limit = 500
+extra = "--concurrency 1 --max_tokens 4096"
+# USD per 1M tokens from the provider's pricing page -- uncomment and fill in so cost can be compared:
+# price_in = 0.10
+# price_out = 0.40
+
+# Claude flagship baseline (key: ANTHROPIC_API_KEY secret; skipped if the secret is not attached)
+[claude]
+enabled = true
+run = "claude_opus_5_5"
+model = "claude-opus-5-5"
+limit = 500
+extra = ""
