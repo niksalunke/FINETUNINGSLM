@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -61,6 +62,9 @@ def parse_args():
     ap.add_argument("--price_out", type=float, default=None, help="USD per 1M output tokens (incl. thinking)")
     ap.add_argument("--base_url", default=None)
     ap.add_argument("--api_key_env", default=None)
+    ap.add_argument("--rate_limit_wait", type=float, default=600,
+                    help="seconds to keep retrying a request rejected with 429 / 'at capacity' before recording it "
+                         "as failed (free tiers on busy models need patience)")
     return ap.parse_args()
 
 
@@ -108,6 +112,28 @@ class OpenAICompatClient:
                 getattr(usage, "completion_tokens", 0), choice.finish_reason)
 
 
+def is_rate_limited(e: Exception) -> bool:
+    return type(e).__name__ == "RateLimitError" or getattr(e, "status_code", None) == 429
+
+
+def call_with_patience(call, messages, max_wait: float):
+    """Retry 429s with growing pauses (on top of the SDK's own quick retries).
+
+    Returns (result, seconds the successful attempt took) so waiting never counts as model latency."""
+    waited, delay = 0.0, 15.0
+    while True:
+        t = time.perf_counter()
+        try:
+            return call(messages), time.perf_counter() - t
+        except Exception as e:
+            if not is_rate_limited(e) or waited >= max_wait:
+                raise
+            pause = min(delay, max_wait - waited) * random.uniform(0.8, 1.2)
+            time.sleep(pause)
+            waited += pause
+            delay = min(delay * 2, 120.0)
+
+
 def main():
     args = parse_args()
     price_in, price_out = args.price_in, args.price_out
@@ -135,12 +161,11 @@ def main():
     lock = threading.Lock()
 
     def work(row):
-        t = time.perf_counter()
         try:
-            text, tin, tout, stop = call(messages_for(row, "fewshot", few_shot))
+            (text, tin, tout, stop), lat = call_with_patience(
+                call, messages_for(row, "fewshot", few_shot), args.rate_limit_wait)
         except Exception as e:  # recorded and retried on the next run
             return make_record(row, None, error=f"api_error: {type(e).__name__}: {str(e)[:200]}")
-        lat = time.perf_counter() - t
         cost = None if price_in is None else (tin * price_in + tout * price_out) / 1e6
         return make_record(row, text, in_tokens=tin, out_tokens=tout, latency_s=lat,
                            cost_usd=cost, stop_reason=stop)
@@ -175,7 +200,8 @@ def main():
     }
     write_run(args.preds_dir, args.run, records, meta)
     if api_errors:
-        print(f"{api_errors} requests failed; re-run the same command to retry them")
+        first = next(r["error"] for r in records if str(r.get("error") or "").startswith("api_error"))
+        print(f"{api_errors} requests failed; re-run the same command to retry them. First error:\n  {first}")
     print({k: meta[k] for k in ("cost_usd_total", "cost_per_1m_questions_usd", "latency_p50_s")})
 
 
