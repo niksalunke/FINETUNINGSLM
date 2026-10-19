@@ -65,6 +65,8 @@ def parse_args():
     ap.add_argument("--rate_limit_wait", type=float, default=600,
                     help="seconds to keep retrying a request rejected with 429 / 'at capacity' before recording it "
                          "as failed (free tiers on busy models need patience)")
+    ap.add_argument("--request_timeout", type=float, default=300,
+                    help="seconds before one request is abandoned (and retried on the next run)")
     ap.add_argument("--max_minutes", type=float, default=None,
                     help="stop starting new requests after this many minutes; unfinished questions are retried "
                          "on the next run (keeps a Kaggle session from running out of time)")
@@ -75,7 +77,7 @@ class AnthropicClient:
     def __init__(self, args):
         import anthropic
         self.anthropic = anthropic
-        self.client = anthropic.Anthropic(max_retries=6)
+        self.client = anthropic.Anthropic(max_retries=2, timeout=args.request_timeout)
         self.args = args
 
     def __call__(self, messages):
@@ -100,7 +102,8 @@ class OpenAICompatClient:
         key_env = args.api_key_env or key_env
         if not key_env or key_env not in os.environ:
             sys.exit(f"set the API key environment variable ({key_env or '--api_key_env'})")
-        self.client = OpenAI(base_url=base_url, api_key=os.environ[key_env], max_retries=6)
+        self.client = OpenAI(base_url=base_url, api_key=os.environ[key_env], max_retries=2,
+                             timeout=args.request_timeout)
         self.args = args
 
     def __call__(self, messages):

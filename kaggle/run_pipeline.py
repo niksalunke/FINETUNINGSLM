@@ -143,7 +143,7 @@ class Runner:
         # 3 questions, short waits: a busy provider must never hold up training.
         # Separate folder so these answers never mix into the real comparison.
         self.sh(self.api_cmd("openai_compatible", sec, 3, f"{sec['run']}_smoketest", "results/smoketest")
-                + ["--rate_limit_wait", "30", "--max_minutes", "5"], check=False)
+                + ["--rate_limit_wait", "30", "--max_minutes", "5", "--request_timeout", "90"], check=False)
 
     def launch(self, args: list[str]):
         """Run train.py on every visible GPU (DDP via accelerate) -- the dry run and the real run use the same path."""
