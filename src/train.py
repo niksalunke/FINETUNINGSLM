@@ -194,6 +194,35 @@ class AnswerOnlyLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
+def finalize_hub(trainer, repo: str, final_dir: Path):
+    """Training is complete: keep only what is still useful on the Hub.
+
+    During training every checkpoint (adapter + optimizer state, ~0.4 GB) overwrites `last-checkpoint`, but the
+    Hub keeps each old version in the repo history. Once the final adapter is uploaded nothing needs to resume,
+    so the checkpoint is deleted and the history squashed: the repo shrinks from GBs to the ~130 MB adapter."""
+    from huggingface_hub import HfApi
+    api = HfApi()
+    finish_push = getattr(trainer, "_finish_current_push", None)
+    if finish_push:  # let the Trainer's background checkpoint upload finish before rewriting the repo
+        try:
+            finish_push()
+        except Exception as e:
+            print(f"(waiting for the last checkpoint upload failed: {type(e).__name__})")
+    api.upload_folder(repo_id=repo, folder_path=str(final_dir), path_in_repo="final_adapter",
+                      commit_message="final adapter (training complete)")
+    print(f"final adapter uploaded to {repo}/final_adapter")
+    try:
+        api.delete_folder("last-checkpoint", repo_id=repo, commit_message="training complete: checkpoint not needed")
+    except Exception as e:  # e.g. never uploaded
+        print(f"(no last-checkpoint to delete: {type(e).__name__})")
+    try:
+        api.super_squash_history(repo_id=repo)
+        print("old checkpoint versions removed from the Hub history (repo is now small)")
+    except Exception as e:
+        print(f"WARNING: could not squash the Hub history ({type(e).__name__}: {str(e)[:120]}); "
+              "old checkpoints still count toward storage")
+
+
 def read_jsonl(path, limit=None):
     rows = []
     with open(path, encoding="utf-8") as fh:
@@ -342,8 +371,7 @@ def main():
         (final / "train_config.json").write_text(json.dumps(vars(args), indent=1))
         print(f"saved adapter to {final}")
         if args.hub_repo:
-            trainer.model.push_to_hub(args.hub_repo, private=True)
-            tokenizer.push_to_hub(args.hub_repo, private=True)
+            finalize_hub(trainer, args.hub_repo, final)
 
 
 if __name__ == "__main__":

@@ -300,9 +300,23 @@ class Runner:
             print(f"needs about {sessions} sessions: training pauses at {t['max_hours']} h and continues on the next "
                   f"Save & Run All. That requires the Hub backup (hub_repo: {backup}).")
 
+    def fetch_final_adapter(self) -> bool:
+        """Training finished in an earlier session: get its final adapter from the Hub."""
+        if not self.repo or self.dry:
+            return False
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(self.repo, allow_patterns=["final_adapter/*"], local_dir=ROOT / self.cfg["train"]["out"])
+        except Exception as e:
+            print(f"could not check the Hub for a final adapter ({type(e).__name__})")
+        return self.train_done
+
     def train(self):
         if self.train_done or self.hero_answered:
             print("training already finished")
+            return
+        if self.fetch_final_adapter():
+            print(f"training finished in an earlier session - final adapter downloaded from {self.repo}")
             return
         self.need_gpu()
         t = self.cfg["train"]
