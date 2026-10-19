@@ -40,6 +40,12 @@ class Runner:
     def __init__(self, cfg: dict, dry: bool):
         self.cfg = cfg
         self.dry = dry
+        self.t0 = time.time()
+
+    def minutes_left(self, reserve_minutes: float = 0) -> float:
+        """Minutes left in the Kaggle session (a commit is killed at 12 h, which can lose its outputs)."""
+        session = self.cfg["pipeline"].get("session_hours", 11.5) * 60
+        return session - (time.time() - self.t0) / 60 - reserve_minutes
 
     # ------------------------------------------------------------------ helpers
     def sh(self, cmd: list[str], check: bool = True) -> int:
@@ -134,8 +140,10 @@ class Runner:
         if not self.llm_ready():
             return
         sec = self.cfg["llm"]
-        # separate folder so these 5 answers never mix into the real comparison
-        self.sh(self.api_cmd("openai_compatible", sec, 5, f"{sec['run']}_smoketest", "results/smoketest"), check=False)
+        # 3 questions, short waits: a busy provider must never hold up training.
+        # Separate folder so these answers never mix into the real comparison.
+        self.sh(self.api_cmd("openai_compatible", sec, 3, f"{sec['run']}_smoketest", "results/smoketest")
+                + ["--rate_limit_wait", "30", "--max_minutes", "5"], check=False)
 
     def launch(self, args: list[str]):
         """Run train.py on every visible GPU (DDP via accelerate) -- the dry run and the real run use the same path."""
@@ -241,8 +249,14 @@ class Runner:
             return
         self.need_gpu()
         t = self.cfg["train"]
+        # stop early enough to leave time for merge, inference and the report in this session
+        reserve = self.cfg["pipeline"].get("reserve_after_train_minutes", 75)
+        hours = min(t["max_hours"], self.minutes_left(reserve) / 60)
+        if hours < 0.25 and not self.dry:
+            raise StopPipeline("not enough session time left to train - run the notebook again")
+        print(f"training time budget this session: {hours:.1f} h")
         args = self.train_args(t["out"]) + ["--epochs", str(t["epochs"]), "--save_steps", str(t["save_steps"]),
-                                             "--max_hours", str(t["max_hours"]), "--resume"]
+                                             "--max_hours", f"{hours:.2f}", "--resume"]
         if t.get("hub_repo"):
             if os.environ.get("HF_TOKEN"):
                 args += ["--hub_repo", t["hub_repo"]]
@@ -295,12 +309,19 @@ class Runner:
         if not self.train_done and not self.dry:
             print("training not finished - API baselines wait, so they are only paid for once")
             return
-        if self.llm_ready():
-            sec = self.cfg["llm"]
-            self.sh(self.api_cmd("openai_compatible", sec, sec["limit"], sec["run"], "results/preds"), check=False)
-        if self.claude_ready():
-            sec = self.cfg["claude"]
-            self.sh(self.api_cmd("anthropic", sec, sec["limit"], sec["run"], "results/preds"), check=False)
+        # API runs get only the session time that is left (minus a few minutes for the report);
+        # unfinished questions are kept and continued on the next run.
+        for ready, provider, key in ((self.llm_ready, "openai_compatible", "llm"), (self.claude_ready, "anthropic", "claude")):
+            if not ready():
+                continue
+            minutes = self.minutes_left(reserve_minutes=10)
+            if minutes < 3 and not self.dry:
+                print(f"no session time left for {key} - run the notebook again to continue it")
+                continue
+            sec = self.cfg[key]
+            print(f"{key}: up to {minutes:.0f} min this session")
+            self.sh(self.api_cmd(provider, sec, sec["limit"], sec["run"], "results/preds")
+                    + ["--max_minutes", f"{minutes:.0f}"], check=False)
 
     def evaluate(self):
         if not list((ROOT / "results/preds").glob("*.meta.json")) and not self.dry:

@@ -65,6 +65,9 @@ def parse_args():
     ap.add_argument("--rate_limit_wait", type=float, default=600,
                     help="seconds to keep retrying a request rejected with 429 / 'at capacity' before recording it "
                          "as failed (free tiers on busy models need patience)")
+    ap.add_argument("--max_minutes", type=float, default=None,
+                    help="stop starting new requests after this many minutes; unfinished questions are retried "
+                         "on the next run (keeps a Kaggle session from running out of time)")
     return ap.parse_args()
 
 
@@ -116,19 +119,25 @@ def is_rate_limited(e: Exception) -> bool:
     return type(e).__name__ == "RateLimitError" or getattr(e, "status_code", None) == 429
 
 
-def call_with_patience(call, messages, max_wait: float):
-    """Retry 429s with growing pauses (on top of the SDK's own quick retries).
+class OutOfTime(Exception):
+    pass
+
+
+def call_with_patience(call, messages, max_wait: float, deadline: float = float("inf")):
+    """Retry 429s with growing pauses (on top of the SDK's own quick retries), never past `deadline`.
 
     Returns (result, seconds the successful attempt took) so waiting never counts as model latency."""
     waited, delay = 0.0, 15.0
     while True:
+        if time.time() >= deadline:
+            raise OutOfTime("time limit reached - re-run to continue")
         t = time.perf_counter()
         try:
             return call(messages), time.perf_counter() - t
         except Exception as e:
             if not is_rate_limited(e) or waited >= max_wait:
                 raise
-            pause = min(delay, max_wait - waited) * random.uniform(0.8, 1.2)
+            pause = min(delay, max_wait - waited, max(0.0, deadline - time.time())) * random.uniform(0.8, 1.0)
             time.sleep(pause)
             waited += pause
             delay = min(delay * 2, 120.0)
@@ -159,11 +168,12 @@ def main():
     print(f"{len(rows)} questions, {len(done)} already done, {len(todo)} to run")
 
     lock = threading.Lock()
+    deadline = time.time() + args.max_minutes * 60 if args.max_minutes else float("inf")
 
     def work(row):
         try:
             (text, tin, tout, stop), lat = call_with_patience(
-                call, messages_for(row, "fewshot", few_shot), args.rate_limit_wait)
+                call, messages_for(row, "fewshot", few_shot), args.rate_limit_wait, deadline)
         except Exception as e:  # recorded and retried on the next run
             return make_record(row, None, error=f"api_error: {type(e).__name__}: {str(e)[:200]}")
         cost = None if price_in is None else (tin * price_in + tout * price_out) / 1e6
