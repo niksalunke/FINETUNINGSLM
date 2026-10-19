@@ -17,8 +17,8 @@ epochs = 2
 lr = 2e-4
 short_prompt = true     # fine-tuned model gets a one-line instruction (~300 fewer tokens per example);
                         # prompted models (base SLM, API LLMs) always get the full instructions + examples
-quantize_4bit = true    # true = QLoRA (least memory); false = LoRA on 16-bit weights (more memory, often faster)
-gradient_checkpointing = true   # false = no recomputation (~25% less compute) but much more activation memory
+quantize_4bit = false   # speedtest on 2x T4: 16-bit LoRA 1.16 ex/s (9.1 GB peak) vs QLoRA 1.03 ex/s (5.5 GB)
+gradient_checkpointing = true   # must stay on: without it a 4B model runs out of memory on a T4, even at batch 1
 batch_size = 2          # per GPU; keep batch_size x grad_accum x 2 GPUs = 32
 grad_accum = 8
 max_len = 2048
