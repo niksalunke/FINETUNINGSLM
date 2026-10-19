@@ -24,8 +24,11 @@ import sys
 import time
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation on 15 GB T4s
+
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainerCallback,
                           TrainingArguments, set_seed)
@@ -161,6 +164,30 @@ def resolve_resume(args, targs) -> str | None:
     return None
 
 
+class AnswerOnlyLossTrainer(Trainer):
+    """Scores only the positions whose next token is part of the answer.
+
+    The default loss turns every position into a 152k-vocabulary logit row (several GB for a 2 x 1,300-token
+    batch), although only the ~30-80 answer tokens are trained. Passing those positions as `logits_to_keep`
+    gives the same loss for a fraction of the memory. The loss is a per-batch mean, and the Trainer is told so,
+    which keeps gradient-accumulation scaling identical on transformers 4.x and 5.x.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.model_accepts_loss_kwargs = False  # 4.x: divide by grad-accum steps
+        self.loss_is_scaled_for_ga = False      # 5.x: same
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        targets = inputs["labels"][:, 1:]                             # position t predicts token t+1
+        keep = (targets != -100).any(dim=0).nonzero(as_tuple=True)[0]  # positions any row trains on
+        outputs = model(input_ids=inputs["input_ids"], attention_mask=inputs["attention_mask"], logits_to_keep=keep)
+        logits = outputs.logits.float()
+        kept = targets[:, keep]
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), kept.reshape(-1), ignore_index=-100)
+        return (loss, outputs) if return_outputs else loss
+
+
 def read_jsonl(path, limit=None):
     rows = []
     with open(path, encoding="utf-8") as fh:
@@ -248,6 +275,7 @@ def main():
         ddp_find_unused_parameters=False,
         dataloader_num_workers=2,
         remove_unused_columns=False,
+        prediction_loss_only=True,  # evaluation needs the loss only, never the full logits
         seed=args.seed,
         push_to_hub=bool(args.hub_repo),
         hub_model_id=args.hub_repo,
@@ -264,7 +292,7 @@ def main():
     if args.max_hours:
         budget = TimeBudget(args.max_hours, torch.device("cuda", local_rank) if on_gpu else torch.device("cpu"))
         callbacks.append(budget)
-    trainer = Trainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds,
+    trainer = AnswerOnlyLossTrainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds,
                       data_collator=Collator(tokenizer.pad_token_id), callbacks=callbacks)
     resume = resolve_resume(args, targs)
     if is_main:
