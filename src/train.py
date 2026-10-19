@@ -297,7 +297,10 @@ def main():
     resume = resolve_resume(args, targs)
     if is_main:
         print(f"resuming from {resume}" if resume else "starting fresh")
-    trainer.train(resume_from_checkpoint=resume)
+    result = trainer.train(resume_from_checkpoint=resume)
+    if trainer.is_world_process_zero():
+        # speed numbers for the pipeline's training-time estimate
+        (Path(args.out) / "train_metrics.json").write_text(json.dumps(result.metrics, indent=1))
 
     if budget is not None and budget.hit:
         if trainer.is_world_process_zero():

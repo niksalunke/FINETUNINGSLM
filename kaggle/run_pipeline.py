@@ -11,6 +11,8 @@ an interrupted training run continues from its last checkpoint and finished API 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shlex
 import shutil
@@ -124,16 +126,45 @@ class Runner:
         # separate folder so these 5 answers never mix into the real comparison
         self.sh(self.api_cmd("openai_compatible", sec, 5, f"{sec['run']}_smoketest", "results/smoketest"), check=False)
 
+    def launch(self, args: list[str]):
+        """Run train.py on every visible GPU (DDP via accelerate) -- the dry run and the real run use the same path."""
+        n = max(1, self.n_gpus())
+        if n > 1:
+            launcher = ([shutil.which("accelerate"), "launch"] if shutil.which("accelerate")
+                        else [PY, "-m", "accelerate.commands.launch"])
+            self.sh([*launcher, "--multi_gpu", "--num_processes", str(n), "--mixed_precision", "fp16", *args])
+        else:
+            self.sh([PY, *args])
+
     def dryrun(self):
         self.need_gpu()
         d = self.cfg["dryrun"]
         out = "outputs/dryrun"
-        if self.exists(f"{out}/final_adapter/adapter_config.json"):
-            print("dry run already passed in this session")
+        if not self.dry:
+            shutil.rmtree(ROOT / out, ignore_errors=True)  # always a fresh test of the current code
+        self.launch(self.train_args(out) + ["--max_train_samples", str(d["samples"]),
+                                            "--val_samples", str(d["val_samples"]), "--epochs", "1",
+                                            "--save_steps", "1000"])
+        print(f"DRY RUN OK - training works on this machine ({max(1, self.n_gpus())} GPU)")
+        self.estimate_training_time(ROOT / out / "train_metrics.json")
+
+    def estimate_training_time(self, metrics_path: Path):
+        if self.dry or not metrics_path.exists():
             return
-        self.sh([PY, *self.train_args(out), "--max_train_samples", str(d["samples"]),
-                 "--val_samples", str(d["val_samples"]), "--epochs", "1", "--save_steps", "1000"])
-        print("DRY RUN OK - training works on this machine")
+        speed = json.loads(metrics_path.read_text())["train_samples_per_second"]
+        n_train = sum(1 for _ in open(ROOT / "data/train.jsonl", encoding="utf-8"))
+        t = self.cfg["train"]
+        hours = t["epochs"] * n_train / speed / 3600
+        print()
+        print(f"measured speed: {speed:.2f} examples/s  ->  full training ({t['epochs']} epochs x {n_train} "
+              f"examples) needs about {hours:.1f} h (an upper estimate: the dry run includes start-up time)")
+        if hours <= t["max_hours"]:
+            print(f"fits in one session (time budget {t['max_hours']} h)")
+        else:
+            sessions = math.ceil(hours / t["max_hours"])
+            backup = "set" if t.get("hub_repo") else "NOT SET - set train.hub_repo in kaggle/config.toml first"
+            print(f"needs about {sessions} sessions: training pauses at {t['max_hours']} h and continues on the next "
+                  f"Save & Run All. That requires the Hub backup (hub_repo: {backup}).")
 
     def train(self):
         if self.train_done:
@@ -148,12 +179,7 @@ class Runner:
                 args += ["--hub_repo", t["hub_repo"]]
             else:
                 print("hub_repo is set but the HF_TOKEN secret is not attached - checkpoints stay local only")
-        n = max(1, self.n_gpus())
-        if n > 1:
-            launcher = [shutil.which("accelerate"), "launch"] if shutil.which("accelerate") else                 [PY, "-m", "accelerate.commands.launch"]
-            self.sh([*launcher, "--multi_gpu", "--num_processes", str(n), "--mixed_precision", "fp16", *args])
-        else:
-            self.sh([PY, *args])
+        self.launch(args)
         if not self.train_done and not self.dry:
             raise StopPipeline("training paused at its time budget - run the notebook again to continue")
 
