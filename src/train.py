@@ -16,7 +16,9 @@ otherwise the one on the Hub. Keep the GPU count and batch settings the same whe
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import math
 import os
 import sys
 import time
@@ -213,7 +215,16 @@ def main():
     if is_main:
         model.print_trainable_parameters()
 
-    steps_per_epoch = max(1, len(train_ds) // (args.batch_size * args.grad_accum * world))
+    steps_per_epoch = max(1, math.ceil(len(train_ds) / (args.batch_size * args.grad_accum * world)))
+    # Options that differ between transformers 4.x and 5.x, so the script runs on either:
+    #  - warmup as an integer step count (5.x removed warmup_ratio)
+    #  - length-grouped batching (5.x replaced group_by_length with train_sampling_strategy)
+    ta_fields = {f.name for f in dataclasses.fields(TrainingArguments)}
+    compat = {"warmup_steps": max(1, round(0.03 * steps_per_epoch * args.epochs))}
+    if "train_sampling_strategy" in ta_fields:
+        compat["train_sampling_strategy"] = "group_by_length"
+    else:
+        compat["group_by_length"] = True
     targs = TrainingArguments(
         output_dir=args.out,
         num_train_epochs=args.epochs,
@@ -222,13 +233,11 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
         weight_decay=0.0,
         max_grad_norm=1.0,
         fp16=on_gpu,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        group_by_length=True,  # batches of similar length -> far less padding
         logging_steps=10,
         eval_strategy="steps",
         eval_steps=args.save_steps,
@@ -244,6 +253,7 @@ def main():
         hub_model_id=args.hub_repo,
         hub_strategy="checkpoint",
         hub_private_repo=True,
+        **compat,  # incl. batches of similar length -> far less padding
     )
     if is_main:
         print(f"GPUs={world}  train={len(train_ds)}  ~{steps_per_epoch} optimizer steps/epoch  "
