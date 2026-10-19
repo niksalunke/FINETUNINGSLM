@@ -24,9 +24,13 @@ gradient_checkpointing = true   # must stay on: without it a 4B model runs out o
 batch_size = 2          # per GPU; keep batch_size x grad_accum x 2 GPUs = 32
 grad_accum = 8
 max_len = 2048
-save_steps = 100
+save_steps = 50         # checkpoint every ~20 min of training (each is uploaded to the Hub repo below)
+eval_steps = 100        # validation loss every ~45 min
 max_hours = 10.5        # stop cleanly before Kaggle's 12 h session limit; re-run to continue
-hub_repo = ""           # e.g. "your-hf-username/qwen3-4b-tatqa" -> checkpoints backed up there (needs HF_TOKEN)
+hub_repo = "auto"       # private Hugging Face repo that keeps checkpoints AND results across sessions.
+                        # "auto" = <your HF username>/<hub_name>, read from the HF_TOKEN secret (needs a WRITE token)
+hub_name = "qwen3-4b-tatqa"
+require_hub_backup = true   # refuse to start training without a working backup (a lost session = lost training)
 
 [dryrun]
 samples = 64

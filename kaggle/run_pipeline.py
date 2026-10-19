@@ -41,6 +41,58 @@ class Runner:
         self.cfg = cfg
         self.dry = dry
         self.t0 = time.time()
+        self.repo = None  # private Hugging Face repo holding checkpoints + results (set by init_hub)
+
+    # ------------------------------------------------------------------ Hugging Face backup
+    def init_hub(self):
+        """Find (or create) the private Hub repo that keeps checkpoints and results across Kaggle sessions."""
+        t = self.cfg["train"]
+        want = t.get("hub_repo", "")
+        if not want:
+            print("Hub backup: OFF (train.hub_repo is empty) - nothing survives the end of this session")
+            return
+        if not os.environ.get("HF_TOKEN"):
+            print("Hub backup: OFF - the HF_TOKEN secret is not attached to this notebook")
+            return
+        name = t.get("hub_name", "qwen3-4b-tatqa")
+        if self.dry:
+            self.repo = want if want != "auto" else f"<hf-user>/{name}"
+            return
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            repo = f"{api.whoami()['name']}/{name}" if want == "auto" else want
+            api.create_repo(repo, private=True, exist_ok=True)  # also proves the token can write
+            self.repo = repo
+            print(f"Hub backup: ON -> private repo https://huggingface.co/{repo}")
+        except Exception as e:
+            print(f"Hub backup: FAILED ({type(e).__name__}: {str(e)[:200]})")
+            print("  Check that HF_TOKEN is a token with WRITE access (huggingface.co -> Settings -> Access Tokens).")
+
+    def restore_results(self):
+        """On a fresh machine, bring back answers saved by earlier sessions (incl. partial API runs)."""
+        if not self.repo or self.dry:
+            return
+        if list((ROOT / "results/preds").glob("*.jsonl")):
+            return  # this machine already has results
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(self.repo, allow_patterns=["results/*"], local_dir=ROOT)
+            found = sorted(f.name for f in (ROOT / "results/preds").glob("*.meta.json"))
+            print(f"restored earlier results from the Hub: {found or 'none yet'}")
+        except Exception as e:
+            print(f"could not restore results from the Hub ({type(e).__name__}) - continuing without them")
+
+    def backup_results(self, label: str):
+        if not self.repo or self.dry or not (ROOT / "results").is_dir():
+            return
+        try:
+            from huggingface_hub import upload_folder
+            upload_folder(repo_id=self.repo, folder_path=str(ROOT / "results"), path_in_repo="results",
+                          commit_message=f"results after {label}")
+            print(f"results backed up to the Hub ({label})")
+        except Exception as e:
+            print(f"WARNING: results backup failed ({type(e).__name__}: {str(e)[:150]})")
 
     def minutes_left(self, reserve_minutes: float = 0) -> float:
         """Minutes left in the Kaggle session (a commit is killed at 12 h, which can lose its outputs)."""
@@ -75,6 +127,11 @@ class Runner:
     @property
     def train_done(self) -> bool:
         return self.exists(f"{self.cfg['train']['out']}/final_adapter/adapter_config.json")
+
+    @property
+    def hero_answered(self) -> bool:
+        """The fine-tuned model has answered the test set (this session or an earlier one, via the Hub)."""
+        return self.exists("results/preds/slm_finetuned.meta.json")
 
     @property
     def merged(self) -> str:
@@ -244,7 +301,7 @@ class Runner:
                   f"Save & Run All. That requires the Hub backup (hub_repo: {backup}).")
 
     def train(self):
-        if self.train_done:
+        if self.train_done or self.hero_answered:
             print("training already finished")
             return
         self.need_gpu()
@@ -257,11 +314,14 @@ class Runner:
         print(f"training time budget this session: {hours:.1f} h")
         args = self.train_args(t["out"]) + ["--epochs", str(t["epochs"]), "--save_steps", str(t["save_steps"]),
                                              "--max_hours", f"{hours:.2f}", "--resume"]
-        if t.get("hub_repo"):
-            if os.environ.get("HF_TOKEN"):
-                args += ["--hub_repo", t["hub_repo"]]
-            else:
-                print("hub_repo is set but the HF_TOKEN secret is not attached - checkpoints stay local only")
+        args += ["--eval_steps", str(t.get("eval_steps", t["save_steps"]))]
+        if self.repo:
+            args += ["--hub_repo", self.repo]
+            print(f"every checkpoint is uploaded to {self.repo}; a re-run continues from the latest one")
+        elif t.get("require_hub_backup") and not self.dry:
+            raise RuntimeError("no working Hub backup (see 'Hub backup' at the top of this log). Training is "
+                               "refused because a stopped session would lose all progress. Fix the HF_TOKEN "
+                               "secret, or set require_hub_backup = false in kaggle/config.toml")
         self.launch(args)
         if not self.train_done and not self.dry:
             raise StopPipeline("training paused at its time budget - run the notebook again to continue")
@@ -269,6 +329,9 @@ class Runner:
     def merge(self):
         if self.exists(f"{self.merged}/config.json"):
             print("merged model already exists")
+            return
+        if self.hero_answered:
+            print("the fine-tuned model's answers are already saved - no merge needed")
             return
         if not self.train_done and not self.dry:
             raise StopPipeline("no trained adapter yet - run the 'train' stage first")
@@ -291,22 +354,24 @@ class Runner:
         self.sh(base + ["--backend", "hf"])
 
     def infer(self):
-        self.need_gpu()
-        if not self.exists(f"{self.merged}/config.json") and not self.dry:
-            raise StopPipeline("no merged model yet - run the 'merge' stage first")
         todo = [r for r in ("slm_finetuned", "slm_base_fewshot") if not self.exists(f"results/preds/{r}.meta.json")]
         if not todo:
             print("local inference already done")
             return
+        self.need_gpu()
+        if "slm_finetuned" in todo and not self.exists(f"{self.merged}/config.json") and not self.dry:
+            raise StopPipeline("no merged model yet - run the 'merge' stage first")
         if self.cfg["infer"]["backend"] == "vllm":
             # installed only now: vLLM may swap torch versions, which must not disturb training
             if self.sh([PY, "-m", "pip", "install", "-q", "vllm"], check=False):
                 self.cfg["infer"]["backend"] = "hf"
         self._infer(self.merged, "slm_finetuned", "finetuned")
+        self.backup_results("slm_finetuned")
         self._infer(self.cfg["model"]["base"], "slm_base_fewshot", "fewshot")
+        self.backup_results("slm_base_fewshot")
 
     def api(self):
-        if not self.train_done and not self.dry:
+        if not (self.train_done or self.hero_answered) and not self.dry:
             print("training not finished - API baselines wait, so they are only paid for once")
             return
         # API runs get only the session time that is left (minus a few minutes for the report);
@@ -322,12 +387,14 @@ class Runner:
             print(f"{key}: up to {minutes:.0f} min this session")
             self.sh(self.api_cmd(provider, sec, sec["limit"], sec["run"], "results/preds")
                     + ["--max_minutes", f"{minutes:.0f}"], check=False)
+            self.backup_results(sec["run"])
 
     def evaluate(self):
         if not list((ROOT / "results/preds").glob("*.meta.json")) and not self.dry:
             print("nothing to evaluate yet")
             return
         self.sh([PY, "src/evaluate.py", "--preds_dir", "results/preds", "--out", "results", "--hero", "slm_finetuned"])
+        self.backup_results("report")
         print("\nreport: results/summary.md   charts: results/accuracy.png, results/accuracy_vs_cost.png")
 
 
@@ -346,6 +413,8 @@ def main():
 
     runner = Runner(cfg, args.dry)
     print(f"stages: {', '.join(stages)}")
+    runner.init_hub()
+    runner.restore_results()
     t0 = time.time()
     for stage in stages:
         print(f"\n{'=' * 70}\n>>> {stage}   ({(time.time() - t0) / 60:.0f} min elapsed)\n{'=' * 70}", flush=True)

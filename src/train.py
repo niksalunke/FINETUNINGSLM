@@ -61,6 +61,7 @@ def parse_args():
     ap.add_argument("--max_train_samples", type=int, default=None, help="for quick dry runs")
     ap.add_argument("--val_samples", type=int, default=300)
     ap.add_argument("--save_steps", type=int, default=100)
+    ap.add_argument("--eval_steps", type=int, default=None, help="default: same as --save_steps")
     ap.add_argument("--resume", action="store_true",
                     help="continue from the newest checkpoint in --out, else from the Hub (--hub_repo); "
                          "starts fresh if there is none")
@@ -276,7 +277,7 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         eval_strategy="steps",
-        eval_steps=args.save_steps,
+        eval_steps=args.eval_steps or args.save_steps,
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=2,
