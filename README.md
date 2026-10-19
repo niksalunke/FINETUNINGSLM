@@ -83,6 +83,15 @@ python src/evaluate.py --hero slm_finetuned
 
 Kaggle gives about 30 GPU hours per week and 12 h per session. If you are short on time, `--epochs 1` is a reasonable first run.
 
+## Resuming interrupted work
+
+| Step | What happens if it stops | How to continue |
+|---|---|---|
+| Training | `--max_hours 10.5` saves a checkpoint and exits cleanly before Kaggle's 12 h limit. With `--hub_repo`, each checkpoint is also pushed to a private Hugging Face repo | Run the same command again with `--resume`. It continues from the newest local checkpoint, or else downloads `last-checkpoint` from the Hub. Without the Hub, use `--resume_from <checkpoint dir>`. Keep the GPU count and batch settings the same |
+| API runs | Each answer is appended to `results/preds/<run>.partial.jsonl` as it arrives | Run the same command again. Finished questions are skipped and failed ones retried |
+| Data prep | Files already downloaded are not downloaded again | Run it again |
+| Merge / local inference | Takes minutes | Run it again |
+
 ## Known limits
 
 - T4 has no bf16 support. Training and serving run in fp16. If the loss goes NaN, lower `--lr` to 1e-4 or try `--no_4bit`.

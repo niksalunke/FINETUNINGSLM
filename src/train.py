@@ -7,6 +7,11 @@ Single GPU:
     python src/train.py --data data --out outputs/qwen3-4b-tatqa
 Both T4s (DDP, ~2x faster):
     accelerate launch --multi_gpu --num_processes 2 src/train.py --data data --out outputs/qwen3-4b-tatqa
+
+Surviving Kaggle's 12 h session limit: pass --max_hours 11 --resume --hub_repo <user>/<repo>.
+When the time budget runs out, the script saves a checkpoint (and uploads it to the Hub) and exits cleanly.
+Re-running the exact same command continues from the newest checkpoint: the local one if the disk still has it,
+otherwise the one on the Hub. Keep the GPU count and batch settings the same when resuming.
 """
 from __future__ import annotations
 
@@ -14,12 +19,15 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch.utils.data import Dataset
-from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer,
+from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainerCallback,
                           TrainingArguments, set_seed)
+from transformers.trainer_utils import get_last_checkpoint
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -43,11 +51,15 @@ def parse_args():
     ap.add_argument("--max_train_samples", type=int, default=None, help="for quick dry runs")
     ap.add_argument("--val_samples", type=int, default=300)
     ap.add_argument("--save_steps", type=int, default=100)
-    ap.add_argument("--resume", action="store_true", help="resume from the last checkpoint in --out")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from the newest checkpoint in --out, else from the Hub (--hub_repo); "
+                         "starts fresh if there is none")
     ap.add_argument("--resume_from", default=None, help="resume from this checkpoint directory")
     ap.add_argument("--hub_repo", default=None,
                     help="e.g. username/qwen3-4b-tatqa: push every checkpoint to a private HF repo "
                          "(survives Kaggle session limits; needs HF_TOKEN)")
+    ap.add_argument("--max_hours", type=float, default=None,
+                    help="stop cleanly (checkpoint saved) after this many hours of training, e.g. 11 on Kaggle")
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
 
@@ -103,6 +115,50 @@ class Collator:
         return {"input_ids": ids, "labels": labels, "attention_mask": mask}
 
 
+class TimeBudget(TrainerCallback):
+    """Save a checkpoint and stop when the wall-clock budget is used up.
+
+    All DDP ranks must stop on the same step or they deadlock, so the decision is all-reduced."""
+
+    def __init__(self, hours: float, device):
+        self.deadline = time.time() + hours * 3600
+        self.device = device
+        self.hit = False
+
+    def on_step_end(self, args, state, control, **kwargs):
+        flag = torch.tensor([1.0 if time.time() >= self.deadline else 0.0], device=self.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item() > 0:
+            self.hit = True
+            control.should_save = True
+            control.should_training_stop = True
+        return control
+
+
+def resolve_resume(args, targs) -> str | None:
+    """Checkpoint to continue from: --resume_from, else newest local checkpoint, else the Hub's last-checkpoint."""
+    if args.resume_from:
+        return args.resume_from
+    if not args.resume:
+        return None
+    local = get_last_checkpoint(args.out) if Path(args.out).is_dir() else None
+    if local:
+        return local
+    if args.hub_repo:
+        hub_ckpt = Path(args.out) / "last-checkpoint"
+        with targs.main_process_first(local=True, desc="download checkpoint from the Hub"):
+            if not (hub_ckpt / "trainer_state.json").exists():
+                try:
+                    from huggingface_hub import snapshot_download
+                    snapshot_download(args.hub_repo, allow_patterns=["last-checkpoint/*"], local_dir=args.out)
+                except Exception as e:  # no repo yet / no checkpoint yet -> fresh start
+                    print(f"no Hub checkpoint to resume from ({type(e).__name__})")
+        if (hub_ckpt / "trainer_state.json").exists():
+            return str(hub_ckpt)
+    return None
+
+
 def read_jsonl(path, limit=None):
     rows = []
     with open(path, encoding="utf-8") as fh:
@@ -134,9 +190,10 @@ def main():
     quant = None if args.no_4bit else BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.float16)
+    on_gpu = torch.cuda.is_available()  # CPU path exists only for smoke tests (needs --no_4bit)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float16, quantization_config=quant,
-        device_map={"": local_rank}, attn_implementation="sdpa")
+        args.model, torch_dtype=torch.float16 if on_gpu else torch.float32, quantization_config=quant,
+        device_map={"": local_rank} if on_gpu else "cpu", attn_implementation="sdpa")
     model.config.use_cache = False
     if quant is not None:
         model = prepare_model_for_kbit_training(
@@ -168,7 +225,7 @@ def main():
         warmup_ratio=0.03,
         weight_decay=0.0,
         max_grad_norm=1.0,
-        fp16=True,
+        fp16=on_gpu,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         group_by_length=True,  # batches of similar length -> far less padding
@@ -192,12 +249,31 @@ def main():
         print(f"GPUs={world}  train={len(train_ds)}  ~{steps_per_epoch} optimizer steps/epoch  "
               f"effective batch={args.batch_size * args.grad_accum * world}")
 
+    budget = None
+    callbacks = []
+    if args.max_hours:
+        budget = TimeBudget(args.max_hours, torch.device("cuda", local_rank) if on_gpu else torch.device("cpu"))
+        callbacks.append(budget)
     trainer = Trainer(model=model, args=targs, train_dataset=train_ds, eval_dataset=val_ds,
-                      data_collator=Collator(tokenizer.pad_token_id))
-    resume = args.resume_from
-    if resume is None and args.resume and any(Path(args.out).glob("checkpoint-*")):
-        resume = True
+                      data_collator=Collator(tokenizer.pad_token_id), callbacks=callbacks)
+    resume = resolve_resume(args, targs)
+    if is_main:
+        print(f"resuming from {resume}" if resume else "starting fresh")
     trainer.train(resume_from_checkpoint=resume)
+
+    if budget is not None and budget.hit:
+        if trainer.is_world_process_zero():
+            last = get_last_checkpoint(args.out)
+            print(f"time budget of {args.max_hours} h reached at step {trainer.state.global_step}/"
+                  f"{trainer.state.max_steps}; checkpoint: {last}")
+            if args.hub_repo and last:
+                # Synchronous upload so the checkpoint is safe before the session ends.
+                from huggingface_hub import upload_folder
+                upload_folder(repo_id=args.hub_repo, folder_path=last, path_in_repo="last-checkpoint",
+                              commit_message=f"checkpoint at step {trainer.state.global_step} (time budget)")
+                print(f"uploaded to {args.hub_repo}/last-checkpoint")
+            print("re-run the same command with --resume to continue")
+        return
 
     if trainer.is_world_process_zero():
         final = Path(args.out) / "final_adapter"
