@@ -113,6 +113,10 @@ class Runner:
     # ------------------------------------------------------------------ stages
     def setup(self):
         self.sh([PY, "-m", "pip", "install", "-q", "-U", *TRAIN_LIBS])
+        # Kaggle ships an old torchao that current PEFT rejects when it builds plain (non-4-bit) LoRA layers.
+        # Nothing in this project uses torchao, so remove it instead of fighting its version.
+        if subprocess.run([PY, "-m", "pip", "show", "torchao"], capture_output=True).returncode == 0:
+            self.sh([PY, "-m", "pip", "uninstall", "-y", "-q", "torchao"], check=False)
         self.sh(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
         print(f"GPUs visible: {self.n_gpus()}")
 
@@ -161,16 +165,19 @@ class Runner:
         for v in self.cfg.get("speedtest", []):
             out = f"outputs/speedtest/{v['name']}"
             print(f"\n----- {v['name']}: 4-bit={v['quantize_4bit']}  batch {v['batch_size']} x accum {v['grad_accum']}")
-            if not self.dry:
-                shutil.rmtree(ROOT / out, ignore_errors=True)
             override = {k: v[k] for k in ("quantize_4bit", "batch_size", "grad_accum")}
-            try:
-                self.launch(self.train_args(out, override) + [
-                    "--max_train_samples", str(d["samples"]), "--val_samples", str(d["val_samples"]),
-                    "--epochs", "1", "--save_steps", "1000"])
-            except RuntimeError:
-                rows.append({**v, "status": "FAILED (probably out of memory)"})
-                continue
+            if self.exists(f"{out}/train_metrics.json") and not self.dry:
+                print("already measured in this session - reusing the result")
+            else:
+                if not self.dry:
+                    shutil.rmtree(ROOT / out, ignore_errors=True)
+                try:
+                    self.launch(self.train_args(out, override) + [
+                        "--max_train_samples", str(d["samples"]), "--val_samples", str(d["val_samples"]),
+                        "--epochs", "1", "--save_steps", "1000"])
+                except RuntimeError:
+                    rows.append({**v, "status": "FAILED - see the error above (out of memory or a package problem)"})
+                    continue
             if self.dry:
                 continue
             m = json.loads((ROOT / out / "train_metrics.json").read_text())
