@@ -25,6 +25,8 @@ def parse_args():
     ap.add_argument("--model", required=True)
     ap.add_argument("--run", required=True, help="name for this run, e.g. slm_finetuned")
     ap.add_argument("--mode", choices=["finetuned", "fewshot"], default="finetuned")
+    ap.add_argument("--short_prompt", action="store_true",
+                    help="finetuned mode: use the one-line instruction (must match how the model was trained)")
     ap.add_argument("--data", default="data")
     ap.add_argument("--split", default="test")
     ap.add_argument("--limit", type=int, default=None)
@@ -117,7 +119,7 @@ def main():
     few_shot = load_few_shot(args.few_shot) if args.mode == "fewshot" else []
 
     runner = VLLMRunner(args) if args.backend == "vllm" else HFRunner(args)
-    prompts = [runner.prompt(messages_for(r, args.mode, few_shot)) for r in rows]
+    prompts = [runner.prompt(messages_for(r, args.mode, few_shot, args.short_prompt)) for r in rows]
     budget = args.max_model_len - args.max_new_tokens
     fits = [runner.n_tokens(p) <= budget for p in prompts]
     run_idx = [i for i, ok in enumerate(fits) if ok]
@@ -152,7 +154,7 @@ def main():
     n_gpus = args.tp if args.backend == "vllm" else 1
     cost_per_q = args.gpu_hourly_usd * n_gpus * (wall / 3600) / max(n, 1)
     meta = {
-        "kind": "local", "model": args.model, "mode": args.mode, "split": args.split,
+        "kind": "local", "model": args.model, "mode": args.mode, "short_prompt": args.short_prompt, "split": args.split,
         "backend": args.backend, "gpu": gpu_name(), "n_gpus": n_gpus,
         "wall_time_s": wall, "throughput_qps": n / wall if wall else None,
         "out_tokens_per_s": n_out / wall if wall else None,

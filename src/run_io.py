@@ -28,11 +28,11 @@ def load_few_shot(path: str | None) -> list[dict]:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def messages_for(row: dict, mode: str, few_shot: list[dict]) -> list[dict]:
-    """mode 'finetuned' = plain contract (what the SLM was trained on);
+def messages_for(row: dict, mode: str, few_shot: list[dict], short_prompt: bool = False) -> list[dict]:
+    """mode 'finetuned' = the prompt the SLM was trained on (full contract, or the one-line one with short_prompt);
     mode 'fewshot'  = contract + worked examples + permission to reason (best shot for prompted models)."""
     if mode == "finetuned":
-        return build_messages(row["user_prompt"])
+        return build_messages(row["user_prompt"], short=short_prompt)
     if mode == "fewshot":
         return build_messages(row["user_prompt"], few_shot=few_shot, reasoning=True)
     raise ValueError(mode)

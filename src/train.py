@@ -53,6 +53,11 @@ def parse_args():
     ap.add_argument("--batch_size", type=int, default=2, help="per GPU")
     ap.add_argument("--grad_accum", type=int, default=8, help="effective batch = batch_size * grad_accum * n_gpus")
     ap.add_argument("--no_4bit", action="store_true", help="plain LoRA on fp16 weights instead of QLoRA")
+    ap.add_argument("--short_prompt", action="store_true",
+                    help="train with the one-line instruction (~300 fewer tokens per example); "
+                         "inference must then also use --short_prompt")
+    ap.add_argument("--no_grad_ckpt", action="store_true",
+                    help="keep activations instead of recomputing them: ~25%% less compute, much more memory")
     ap.add_argument("--max_train_samples", type=int, default=None, help="for quick dry runs")
     ap.add_argument("--val_samples", type=int, default=300)
     ap.add_argument("--save_steps", type=int, default=100)
@@ -78,12 +83,12 @@ def assistant_suffix(tokenizer) -> str:
 
 
 class SFTDataset(Dataset):
-    def __init__(self, rows, tokenizer, max_len):
+    def __init__(self, rows, tokenizer, max_len, short_prompt=False):
         suffix = assistant_suffix(tokenizer)
         self.examples, dropped = [], 0
         for r in rows:
             prompt = tokenizer.apply_chat_template(
-                build_messages(r["user_prompt"]), tokenize=False, add_generation_prompt=True)
+                build_messages(r["user_prompt"], short=short_prompt), tokenize=False, add_generation_prompt=True)
             p_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
             c_ids = tokenizer(r["target"] + suffix, add_special_tokens=False)["input_ids"]
             ids = p_ids + c_ids
@@ -213,8 +218,10 @@ def main():
 
     if is_main:
         print("building datasets")
-    train_ds = SFTDataset(read_jsonl(Path(args.data) / "train.jsonl", args.max_train_samples), tokenizer, args.max_len)
-    val_ds = SFTDataset(read_jsonl(Path(args.data) / "val.jsonl", args.val_samples), tokenizer, args.max_len)
+    train_ds = SFTDataset(read_jsonl(Path(args.data) / "train.jsonl", args.max_train_samples), tokenizer, args.max_len,
+                          args.short_prompt)
+    val_ds = SFTDataset(read_jsonl(Path(args.data) / "val.jsonl", args.val_samples), tokenizer, args.max_len,
+                        args.short_prompt)
 
     quant = None if args.no_4bit else BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
@@ -227,7 +234,8 @@ def main():
     mem_load_gb = torch.cuda.memory_allocated(local_rank) / 2**30 if on_gpu else 0.0
     if quant is not None:
         model = prepare_model_for_kbit_training(
-            model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})
+            model, use_gradient_checkpointing=not args.no_grad_ckpt,
+            gradient_checkpointing_kwargs={"use_reentrant": False})
     else:
         model.enable_input_require_grads()
 
@@ -264,7 +272,7 @@ def main():
         weight_decay=0.0,
         max_grad_norm=1.0,
         fp16=on_gpu,
-        gradient_checkpointing=True,
+        gradient_checkpointing=not args.no_grad_ckpt,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=10,
         eval_strategy="steps",
@@ -308,7 +316,8 @@ def main():
                 gpu_mem_peak_gb=round(torch.cuda.max_memory_allocated(local_rank) / 2**30, 2),
                 gpu_mem_total_gb=round(torch.cuda.get_device_properties(local_rank).total_memory / 2**30, 2),
                 longest_example_tokens=max(len(e["input_ids"]) for e in train_ds.examples),
-                max_len=args.max_len, quantize_4bit=not args.no_4bit, batch_size=args.batch_size)
+                max_len=args.max_len, quantize_4bit=not args.no_4bit, batch_size=args.batch_size,
+                gradient_checkpointing=not args.no_grad_ckpt, short_prompt=args.short_prompt)
         (Path(args.out) / "train_metrics.json").write_text(json.dumps(metrics, indent=1))
 
     if budget is not None and budget.hit:

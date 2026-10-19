@@ -29,6 +29,12 @@ Rules:
 - "equation" uses only numbers, + - * / and parentheses. Write plain numbers without commas, currency symbols or units. It is evaluated by Python and must produce the final number in the stated scale (for a percentage change write ((new - old) / old) * 100 with scale "percent").
 - Copy span answers exactly as they appear in the context."""
 
+# The fine-tuned SLM learns the full contract from 13k examples, so it only needs a one-line reminder.
+# This removes ~300 tokens from every training example (about a third of the compute) and from every
+# question it answers later. Prompted models (base SLM, API LLMs) always get the full SYSTEM_PROMPT.
+SYSTEM_PROMPT_SHORT = ("Answer from the financial report as one JSON object with answer_type, "
+                       "then answer, equation or items, and scale.")
+
 # Extra instruction for models that are prompted (not fine-tuned): they may reason first.
 REASONING_SUFFIX = """
 
@@ -57,9 +63,11 @@ def build_user_prompt(context: str, question: str) -> str:
     return f"{context}\n\nQuestion: {question}"
 
 
-def build_messages(user_prompt: str, few_shot: list[dict] | None = None, reasoning: bool = False) -> list[dict]:
-    """Chat messages in OpenAI/HF format. `few_shot` items have keys `user` and `assistant`."""
-    system = SYSTEM_PROMPT + (REASONING_SUFFIX if reasoning else "")
+def build_messages(user_prompt: str, few_shot: list[dict] | None = None, reasoning: bool = False,
+                   short: bool = False) -> list[dict]:
+    """Chat messages in OpenAI/HF format. `few_shot` items have keys `user` and `assistant`.
+    `short` = the one-line instruction used to train and run the fine-tuned model."""
+    system = SYSTEM_PROMPT_SHORT if short else SYSTEM_PROMPT + (REASONING_SUFFIX if reasoning else "")
     messages = [{"role": "system", "content": system}]
     for ex in few_shot or []:
         messages.append({"role": "user", "content": ex["user"]})

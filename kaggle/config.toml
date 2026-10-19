@@ -15,7 +15,10 @@ base = "Qwen/Qwen3-4B-Instruct-2507"
 out = "outputs/qwen3-4b-tatqa"
 epochs = 2
 lr = 2e-4
+short_prompt = true     # fine-tuned model gets a one-line instruction (~300 fewer tokens per example);
+                        # prompted models (base SLM, API LLMs) always get the full instructions + examples
 quantize_4bit = true    # true = QLoRA (least memory); false = LoRA on 16-bit weights (more memory, often faster)
+gradient_checkpointing = true   # false = no recomputation (~25% less compute) but much more activation memory
 batch_size = 2          # per GPU; keep batch_size x grad_accum x 2 GPUs = 32
 grad_accum = 8
 max_len = 2048
@@ -28,30 +31,35 @@ samples = 64
 val_samples = 16
 
 # "speedtest" stage: a short run of each setup below on both GPUs, then a table of speed and memory.
-# Run it with STAGES = "setup,data,speedtest". Each setup keeps the effective batch at 32.
+# Run it with STAGES = "setup,data,speedtest". Each setup keeps the effective batch at 32 and uses
+# [train] short_prompt. Setups already measured with identical settings in the session are reused.
 [[speedtest]]
 name = "qlora_bs2"
 quantize_4bit = true
 batch_size = 2
 grad_accum = 8
-
-[[speedtest]]
-name = "qlora_bs4"
-quantize_4bit = true
-batch_size = 4
-grad_accum = 4
+gradient_checkpointing = true
 
 [[speedtest]]
 name = "lora16_bs2"
 quantize_4bit = false
 batch_size = 2
 grad_accum = 8
+gradient_checkpointing = true
 
 [[speedtest]]
-name = "lora16_bs4"
+name = "qlora_bs1_nockpt"
+quantize_4bit = true
+batch_size = 1
+grad_accum = 16
+gradient_checkpointing = false
+
+[[speedtest]]
+name = "lora16_bs1_nockpt"
 quantize_4bit = false
-batch_size = 4
-grad_accum = 4
+batch_size = 1
+grad_accum = 16
+gradient_checkpointing = false
 
 [infer]
 backend = "vllm"        # falls back to "hf" automatically if vLLM fails

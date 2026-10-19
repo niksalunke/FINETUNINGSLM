@@ -108,6 +108,10 @@ class Runner:
                 "--max_len", str(t["max_len"])]
         if not t.get("quantize_4bit", True):
             args.append("--no_4bit")
+        if not t.get("gradient_checkpointing", True):
+            args.append("--no_grad_ckpt")
+        if t.get("short_prompt"):
+            args.append("--short_prompt")
         return args
 
     # ------------------------------------------------------------------ stages
@@ -163,21 +167,28 @@ class Runner:
         epochs, max_len = self.cfg["train"]["epochs"], self.cfg["train"]["max_len"]
         rows = []
         for v in self.cfg.get("speedtest", []):
+            v = {"gradient_checkpointing": True, **v}
             out = f"outputs/speedtest/{v['name']}"
-            print(f"\n----- {v['name']}: 4-bit={v['quantize_4bit']}  batch {v['batch_size']} x accum {v['grad_accum']}")
-            override = {k: v[k] for k in ("quantize_4bit", "batch_size", "grad_accum")}
-            if self.exists(f"{out}/train_metrics.json") and not self.dry:
-                print("already measured in this session - reusing the result")
+            print(f"\n----- {v['name']}: 4-bit={v['quantize_4bit']}  batch {v['batch_size']} x accum {v['grad_accum']}"
+                  f"  checkpointing={v['gradient_checkpointing']}  short prompt={self.cfg['train'].get('short_prompt')}")
+            override = {k: v[k] for k in ("quantize_4bit", "batch_size", "grad_accum", "gradient_checkpointing")}
+            args = self.train_args(out, override) + [
+                "--max_train_samples", str(d["samples"]), "--val_samples", str(d["val_samples"]),
+                "--epochs", "1", "--save_steps", "1000"]
+            stamp = ROOT / out / "run_args.json"
+            same = stamp.exists() and json.loads(stamp.read_text()) == args
+            if same and self.exists(f"{out}/train_metrics.json") and not self.dry:
+                print("already measured with these exact settings in this session - reusing the result")
             else:
                 if not self.dry:
                     shutil.rmtree(ROOT / out, ignore_errors=True)
                 try:
-                    self.launch(self.train_args(out, override) + [
-                        "--max_train_samples", str(d["samples"]), "--val_samples", str(d["val_samples"]),
-                        "--epochs", "1", "--save_steps", "1000"])
+                    self.launch(args)
                 except RuntimeError:
                     rows.append({**v, "status": "FAILED - see the error above (out of memory or a package problem)"})
                     continue
+                if not self.dry:
+                    stamp.write_text(json.dumps(args))
             if self.dry:
                 continue
             m = json.loads((ROOT / out / "train_metrics.json").read_text())
@@ -189,21 +200,22 @@ class Runner:
                          "hours": epochs * n_train / speed / 3600, "fits": worst <= total - 1.5})
         if self.dry or not rows:
             return
-        print(f"\n{'setup':<12} {'4-bit':<6} {'batch':<6} {'ex/s':>6} {'peak GB':>8} {'worst@' + str(max_len):>11} "
-              f"{'est. hours':>11}  status")
+        print(f"\n{'setup':<20} {'4-bit':<6} {'batch':<6} {'ckpt':<6} {'ex/s':>6} {'peak GB':>8} "
+              f"{'worst@' + str(max_len):>11} {'est. hours':>11}  status")
         for r in rows:
+            head = f"{r['name']:<20} {str(r['quantize_4bit']):<6} {r['batch_size']:<6} {str(r['gradient_checkpointing']):<6}"
             if r["status"] != "ok":
-                print(f"{r['name']:<12} {str(r['quantize_4bit']):<6} {r['batch_size']:<6} {'':>6} {'':>8} {'':>11} {'':>11}  {r['status']}")
+                print(f"{head} {'':>6} {'':>8} {'':>11} {'':>11}  {r['status']}")
                 continue
             note = "fits" if r["fits"] else "too close to the memory limit for the longest examples"
-            print(f"{r['name']:<12} {str(r['quantize_4bit']):<6} {r['batch_size']:<6} {r['speed']:>6.2f} {r['peak']:>8.1f} "
-                  f"{r['worst']:>11.1f} {r['hours']:>11.1f}  {note}")
+            print(f"{head} {r['speed']:>6.2f} {r['peak']:>8.1f} {r['worst']:>11.1f} {r['hours']:>11.1f}  {note}")
         ok = [r for r in rows if r["status"] == "ok" and r["fits"]]
         if ok:
             best = max(ok, key=lambda r: r["speed"])
             print(f"\nfastest setup that fits: {best['name']}  (~{best['hours']:.1f} h for {epochs} epochs)")
             print(f"to use it, set in kaggle/config.toml [train]: quantize_4bit = {str(best['quantize_4bit']).lower()}, "
-                  f"batch_size = {best['batch_size']}, grad_accum = {best['grad_accum']}")
+                  f"batch_size = {best['batch_size']}, grad_accum = {best['grad_accum']}, "
+                  f"gradient_checkpointing = {str(best['gradient_checkpointing']).lower()}")
 
     def estimate_training_time(self, metrics_path: Path):
         if self.dry or not metrics_path.exists():
@@ -256,6 +268,8 @@ class Runner:
         i = self.cfg["infer"]
         base = [PY, "src/infer_local.py", "--model", model, "--run", run, "--mode", mode,
                 "--gpu_hourly_usd", str(i["gpu_hourly_usd"])]
+        if mode == "finetuned" and self.cfg["train"].get("short_prompt"):
+            base.append("--short_prompt")  # must match how the model was trained
         if i["backend"] == "vllm" and self.sh(base + ["--backend", "vllm"], check=False) == 0:
             return
         if i["backend"] == "vllm":
