@@ -353,20 +353,41 @@ class Runner:
         self.sh([PY, "src/merge_lora.py", "--adapter", f"{self.cfg['train']['out']}/final_adapter",
                  "--out", self.merged])
 
-    def _infer(self, model: str, run: str, mode: str):
-        if self.exists(f"results/preds/{run}.meta.json"):
-            print(f"{run}: already done")
-            return
+    def infer_cmd(self, run: str) -> list[str]:
         i = self.cfg["infer"]
-        base = [PY, "src/infer_local.py", "--model", model, "--run", run, "--mode", mode,
-                "--gpu_hourly_usd", str(i["gpu_hourly_usd"])]
+        mode = "finetuned" if run == "slm_finetuned" else "fewshot"
+        model = self.merged if run == "slm_finetuned" else self.cfg["model"]["base"]
+        cmd = [PY, "src/infer_local.py", "--model", model, "--run", run, "--mode", mode, "--backend", i["backend"],
+               "--gpu_hourly_usd", str(i["gpu_hourly_usd"]), "--latency_n", str(i.get("latency_n", 100)),
+               "--hf_batch_size", str(i.get(f"batch_{mode}", 8))]
         if mode == "finetuned" and self.cfg["train"].get("short_prompt"):
-            base.append("--short_prompt")  # must match how the model was trained
-        if i["backend"] == "vllm" and self.sh(base + ["--backend", "vllm"], check=False) == 0:
-            return
-        if i["backend"] == "vllm":
-            print("vLLM run failed - falling back to the plain Hugging Face backend")
-        self.sh(base + ["--backend", "hf"])
+            cmd.append("--short_prompt")  # must match how the model was trained
+        return cmd
+
+    def run_parallel(self, jobs: dict[str, list[str]]) -> dict[str, int]:
+        """One job per GPU at the same time (each sees only its own GPU); output goes to a log file per job."""
+        procs = {}
+        for gpu, (name, cmd) in enumerate(jobs.items()):
+            print(f"$ [GPU {gpu}] " + " ".join(shlex.quote(c) for c in cmd), flush=True)
+            if self.dry:
+                continue
+            log = open(ROOT / f"results/{name}.log", "w", encoding="utf-8")
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}
+            procs[name] = (subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT), log)
+        codes = {}
+        while procs:
+            time.sleep(60)
+            for name, (proc, log) in list(procs.items()):
+                if proc.poll() is not None:
+                    log.close()
+                    codes[name] = proc.returncode
+                    tail = (ROOT / f"results/{name}.log").read_text(encoding="utf-8", errors="replace")[-1500:]
+                    print(f"\n--- {name} finished (exit {proc.returncode}); end of its log:\n{tail}", flush=True)
+                    del procs[name]
+            if procs:
+                print(f"  still running: {', '.join(procs)}  ({(time.time() - self.t0) / 60:.0f} min elapsed)",
+                      flush=True)
+        return codes
 
     def infer(self):
         todo = [r for r in ("slm_finetuned", "slm_base_fewshot") if not self.exists(f"results/preds/{r}.meta.json")]
@@ -376,14 +397,16 @@ class Runner:
         self.need_gpu()
         if "slm_finetuned" in todo and not self.exists(f"{self.merged}/config.json") and not self.dry:
             raise StopPipeline("no merged model yet - run the 'merge' stage first")
-        if self.cfg["infer"]["backend"] == "vllm":
-            # installed only now: vLLM may swap torch versions, which must not disturb training
-            if self.sh([PY, "-m", "pip", "install", "-q", "vllm"], check=False):
-                self.cfg["infer"]["backend"] = "hf"
-        self._infer(self.merged, "slm_finetuned", "finetuned")
-        self.backup_results("slm_finetuned")
-        self._infer(self.cfg["model"]["base"], "slm_base_fewshot", "fewshot")
-        self.backup_results("slm_base_fewshot")
+        (ROOT / "results").mkdir(exist_ok=True)
+        if max(1, self.n_gpus()) >= 2 and len(todo) == 2:
+            print("testing both models at the same time, one per GPU (progress is in results/<run>.log)")
+            codes = self.run_parallel({run: self.infer_cmd(run) for run in todo})
+        else:
+            codes = {run: self.sh(self.infer_cmd(run), check=False) for run in todo}
+        self.backup_results("local inference")
+        failed = [run for run, code in codes.items() if code]
+        if failed:
+            raise RuntimeError(f"inference failed for {failed} (see the log above); finished runs are saved")
 
     def api(self):
         if not (self.train_done or self.hero_answered) and not self.dry:

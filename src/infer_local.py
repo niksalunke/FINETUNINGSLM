@@ -84,22 +84,39 @@ class HFRunner:
     def n_tokens(self, prompt):
         return len(self.tok(prompt, add_special_tokens=False)["input_ids"])
 
-    def generate(self, prompts):
-        order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
-        results = [None] * len(prompts)
-        for s in range(0, len(order), self.bs):
-            idx = order[s:s + self.bs]
-            enc = self.tok([prompts[i] for i in idx], return_tensors="pt", padding=True,
+    def _generate_batch(self, batch_prompts):
+        """Generate for one batch; on out-of-memory, split the batch in half and retry."""
+        try:
+            enc = self.tok(batch_prompts, return_tensors="pt", padding=True,
                            add_special_tokens=False).to(self.model.device)
             with self.torch.no_grad():
                 out = self.model.generate(**enc, max_new_tokens=self.max_new, do_sample=False,
                                           pad_token_id=self.tok.pad_token_id)
-            for j, i in enumerate(idx):
-                gen = out[j, enc["input_ids"].shape[1]:]
-                n_out = int((gen != self.tok.pad_token_id).sum())
-                n_in = int(enc["attention_mask"][j].sum())
-                results[i] = (self.tok.decode(gen, skip_special_tokens=True), n_in, n_out)
-            print(f"  {min(s + self.bs, len(order))}/{len(order)}", end="\r")
+        except self.torch.cuda.OutOfMemoryError:
+            if len(batch_prompts) == 1:
+                raise
+            self.torch.cuda.empty_cache()
+            half = len(batch_prompts) // 2
+            return self._generate_batch(batch_prompts[:half]) + self._generate_batch(batch_prompts[half:])
+        results = []
+        for j in range(len(batch_prompts)):
+            gen = out[j, enc["input_ids"].shape[1]:]
+            n_out = int((gen != self.tok.pad_token_id).sum())
+            n_in = int(enc["attention_mask"][j].sum())
+            results.append((self.tok.decode(gen, skip_special_tokens=True), n_in, n_out))
+        return results
+
+    def generate(self, prompts):
+        order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+        results = [None] * len(prompts)
+        t0 = time.perf_counter()
+        for s in range(0, len(order), self.bs):
+            idx = order[s:s + self.bs]
+            for i, r in zip(idx, self._generate_batch([prompts[i] for i in idx])):
+                results[i] = r
+            done = min(s + self.bs, len(order))
+            if len(order) > 1 and (done // self.bs) % 10 == 0 or done == len(order):
+                print(f"  {done}/{len(order)} questions  ({(time.perf_counter() - t0) / 60:.1f} min)", flush=True)
         return results
 
 
