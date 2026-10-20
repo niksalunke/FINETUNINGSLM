@@ -184,7 +184,8 @@ class Runner:
         # Nothing in this project uses torchao, so remove it instead of fighting its version.
         if subprocess.run([PY, "-m", "pip", "show", "torchao"], capture_output=True).returncode == 0:
             self.sh([PY, "-m", "pip", "uninstall", "-y", "-q", "torchao"], check=False)
-        self.sh(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
+        if shutil.which("nvidia-smi"):  # absent in a CPU-only session (the API comparison run)
+            self.sh(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv"], check=False)
         print(f"GPUs visible: {self.n_gpus()}")
 
     def data(self):

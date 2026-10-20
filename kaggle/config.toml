@@ -5,8 +5,12 @@
 [pipeline]
 # Stages run in this order when the notebook calls run_pipeline.py with no --stages.
 # Every stage skips itself if its work is already done, so re-running is always safe.
-# "dryrun" is not in this list: run it interactively with  --stages setup,data,dryrun
-stages = ["setup", "data", "llm_smoketest", "train", "merge", "infer", "api", "evaluate"]
+#
+# GPU session (Accelerator: GPU T4 x2):  STAGES = ""  -> train + test the local models only, no outside API calls
+# CPU session (Accelerator: None), after the GPU run:  STAGES = "setup,data,api,evaluate"
+#   -> the API models answer the same questions; results come and go through the Hub repo, no GPU used.
+# Other stages you can name explicitly: dryrun, speedtest, llm_smoketest
+stages = ["setup", "data", "train", "merge", "infer", "evaluate"]
 session_hours = 11.5                # Kaggle kills a session at 12 h; everything is planned to finish before this
 reserve_after_train_minutes = 75    # training stops early enough to leave this for merge, inference and the report
 
