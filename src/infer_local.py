@@ -208,7 +208,8 @@ def main():
     n_gpus = args.tp if args.backend == "vllm" else 1
     cost_per_q = args.gpu_hourly_usd * n_gpus * (wall / 3600) / max(n, 1)
     meta = {
-        "kind": "local", "model": args.model, "mode": args.mode, "short_prompt": args.short_prompt, "split": args.split,
+        "kind": "local", "model": args.model, "mode": args.mode, "short_prompt": args.short_prompt,
+        "max_new_tokens": args.max_new_tokens, "split": args.split,
         "backend": args.backend, "gpu": gpu_name(), "n_gpus": n_gpus,
         "wall_time_s": wall, "throughput_qps": n / wall if wall else None,
         "out_tokens_per_s": n_out / wall if wall else None,

@@ -45,7 +45,19 @@ def load_runs(preds_dir: Path) -> dict:
     return runs
 
 
-def score(metric_cls, gold: dict, recs: dict, uids: list[str]) -> dict:
+def was_cut_off(rec: dict | None, meta: dict) -> bool:
+    """The answer stopped because it hit the output-token limit (thinking + answer), not because it was done."""
+    if not rec:
+        return False
+    if rec.get("stop_reason") in ("length", "max_tokens"):  # OpenAI-style / Anthropic API
+        return True
+    if meta.get("kind") == "local" and rec.get("out_tokens") is not None:
+        limit = meta.get("max_new_tokens") or (256 if meta.get("mode") == "finetuned" else 1024)
+        return rec["out_tokens"] >= limit
+    return False
+
+
+def score(metric_cls, gold: dict, recs: dict, uids: list[str], meta: dict | None = None) -> dict:
     m = metric_cls()
     for uid in uids:
         r = recs.get(uid)
@@ -58,6 +70,7 @@ def score(metric_cls, gold: dict, recs: dict, uids: list[str]) -> dict:
         xs = [d["em"] for d in details if d["answer_type"] == t]
         out[f"em_{t}"] = 100 * sum(xs) / len(xs) if xs else None
     out["unparsable_pct"] = 100 * sum(1 for u in uids if recs.get(u) is None or recs[u]["error"]) / max(len(uids), 1)
+    out["cut_off_pct"] = 100 * sum(1 for u in uids if was_cut_off(recs.get(u), meta or {})) / max(len(uids), 1)
     return out
 
 
@@ -73,13 +86,14 @@ def money(x):
 
 def markdown_table(rows: list[dict], hero: str | None) -> str:
     head = ("| Run | Model | n | EM | F1 | EM span | EM multi-span | EM arithmetic | EM count | "
-            "Unparsable % | Latency p50 (s) | $ per 1M questions |")
-    lines = [head, "|" + "---|" * 12]
+            "Unparsable % | Cut off % | Latency p50 (s) | $ per 1M questions |")
+    lines = [head, "|" + "---|" * 13]
     for r in rows:
         name = f"**{r['run']}**" if r["run"] == hero else r["run"]
         lines.append(" | ".join([
             f"| {name}", r["model"], str(r["n"]), fmt(r["em"]), fmt(r["f1"]), fmt(r["em_span"]),
             fmt(r["em_multi-span"]), fmt(r["em_arithmetic"]), fmt(r["em_count"]), fmt(r["unparsable_pct"]),
+            fmt(r["cut_off_pct"]),
             fmt(r["latency_p50_s"], 2), money(r["cost_per_1m_questions_usd"])]) + " |")
     return "\n".join(lines)
 
@@ -161,7 +175,7 @@ def main():
             uids = sorted(u for u in run["recs"] if u in gold) if view == "full" else common
             meta = run["meta"]
             rows.append({"run": name, "model": meta.get("model"), "kind": meta.get("kind"),
-                         **score(metric_cls, gold, run["recs"], uids),
+                         **score(metric_cls, gold, run["recs"], uids, run["meta"]),
                          "latency_p50_s": meta.get("latency_p50_s"),
                          "cost_per_1m_questions_usd": meta.get("cost_per_1m_questions_usd")})
         rows.sort(key=lambda r: -r["em"])
@@ -180,6 +194,8 @@ def main():
         "- Local cost = GPU $/hour x measured batch wall time; API cost = measured tokens x list price "
         "(thinking tokens included).",
         "- Latency p50 = single request at a time (local) / per request under concurrency (API).",
+        "- Cut off % = answers that hit the output-token limit (thinking + answer) before finishing; "
+        "these count as wrong, so a high value means the limit, not the model, cost points.",
     ]
     (out / "summary.md").write_text("\n".join(report), encoding="utf-8")
     print("\n".join(report))

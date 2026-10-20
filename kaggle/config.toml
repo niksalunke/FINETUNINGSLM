@@ -88,7 +88,8 @@ latency_n = 50          # single requests timed one by one for the latency colum
 # (STAGES = "setup,data,api,evaluate"); all run at the same time. An entry whose key secret is not
 # attached is skipped. Prices: USD per 1M tokens at LIST price (what a business would pay, not free
 # credits) - confirm each on the provider's pricing page; without prices the report shows cost as unknown.
-# max_tokens is the same for every model (room for reasoning + the answer), so no one is cut short.
+# max_tokens caps thinking + final answer together, so it is generous and the same for every model:
+# a reasoning model that runs out mid-thought returns no answer (shown as 'Cut off %' in the report).
 # Active comparison: MiniMax-M2.7 only (the provider's main model line, known list price).
 # The others are kept switched off; set enabled = true to add one.
 
@@ -101,7 +102,7 @@ key_secret = "LLM_API_KEY"
 limit = 500
 price_in = 0.15                              # widely reported Z.ai list price, Oct 2026
 price_out = 0.50
-extra = "--concurrency 1 --max_tokens 8192"
+extra = "--concurrency 1 --max_tokens 32768 --request_timeout 900"
 enabled = false
 
 [[api]]
@@ -113,7 +114,7 @@ key_secret = "LLM_API_KEY"
 limit = 500
 # price_in = ...                             # confirm on DeepSeek's or your provider's pricing page
 # price_out = ...
-extra = "--concurrency 1 --max_tokens 8192"
+extra = "--concurrency 1 --max_tokens 32768 --request_timeout 900"
 enabled = false
 
 [[api]]
@@ -125,7 +126,7 @@ key_secret = "LLM_API_KEY"
 limit = 500
 price_in = 0.30                              # most commonly listed MiniMax list price, Oct 2026
 price_out = 1.20
-extra = "--concurrency 4 --max_tokens 8192"   # answers take ~20 s to several min; 4 at a time
+extra = "--concurrency 4 --max_tokens 32768 --request_timeout 900"   # ~20 s to many min per answer
 enabled = true
 
 [[api]]
