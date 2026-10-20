@@ -359,7 +359,8 @@ class Runner:
         model = self.merged if run == "slm_finetuned" else self.cfg["model"]["base"]
         cmd = [PY, "src/infer_local.py", "--model", model, "--run", run, "--mode", mode, "--backend", i["backend"],
                "--gpu_hourly_usd", str(i["gpu_hourly_usd"]), "--latency_n", str(i.get("latency_n", 100)),
-               "--hf_batch_size", str(i.get(f"batch_{mode}", 8))]
+               "--hf_batch_size", str(i.get(f"batch_{mode}", 8)),
+               "--hf_token_budget", str(i.get(f"token_budget_{mode}", 16000))]
         if mode == "finetuned" and self.cfg["train"].get("short_prompt"):
             cmd.append("--short_prompt")  # must match how the model was trained
         return cmd

@@ -75,8 +75,12 @@ gradient_checkpointing = false
 backend = "hf"          # plain Hugging Face generate. NOT "vllm" on Kaggle: installing vLLM replaces PyTorch with a
                         # build that breaks transformers there (torch/torchaudio CUDA mismatch) - every model load fails
 gpu_hourly_usd = 0.35   # cloud price of one T4, used for the cost comparison
-batch_finetuned = 32    # questions per batch for the fine-tuned model (short answers)
+batch_finetuned = 32    # most questions per batch for the fine-tuned model (short answers)
 batch_fewshot = 8       # for the base model with worked examples + reasoning (long prompts and answers)
+# A batch is also capped at questions x (longest prompt + answer room) tokens, so the longest questions
+# (2,000+ tokens) run in small batches: on a T4 the attention memory grows with batch x length^2.
+token_budget_finetuned = 16000
+token_budget_fewshot = 16000
 latency_n = 50          # single requests timed one by one for the latency column
 
 # Your OpenAI-compatible LLM (key: LLM_API_KEY secret)

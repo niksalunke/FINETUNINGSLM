@@ -12,9 +12,13 @@ Measures two things separately:
 from __future__ import annotations
 
 import argparse
+import gc
+import os
 import sys
 import time
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation on 15 GB T4s
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_io import latency_stats, load_few_shot, load_split, make_record, messages_for, write_run  # noqa: E402
@@ -37,7 +41,10 @@ def parse_args():
     ap.add_argument("--max_model_len", type=int, default=8192)
     ap.add_argument("--tp", type=int, default=1, help="vLLM tensor parallel size (GPUs)")
     ap.add_argument("--gpu_mem", type=float, default=0.90)
-    ap.add_argument("--hf_batch_size", type=int, default=8)
+    ap.add_argument("--hf_batch_size", type=int, default=8, help="most questions per batch")
+    ap.add_argument("--hf_token_budget", type=int, default=16000,
+                    help="max (questions x (longest prompt + max_new_tokens)) per batch, so long questions get "
+                         "small batches; attention memory on a T4 grows with batch x length^2")
     ap.add_argument("--latency_n", type=int, default=100, help="sequential single requests for latency")
     ap.add_argument("--gpu_hourly_usd", type=float, default=0.35,
                     help="what one of these GPUs costs per hour in the cloud (T4 ~0.35; check your provider)")
@@ -77,6 +84,8 @@ class HFRunner:
             device_map={"": 0} if on_gpu else "cpu", attn_implementation="sdpa").eval()
         self.max_new = args.max_new_tokens
         self.bs = args.hf_batch_size
+        self.token_budget = args.hf_token_budget
+        self.oom_skipped = 0
 
     def prompt(self, messages):
         return self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -84,18 +93,31 @@ class HFRunner:
     def n_tokens(self, prompt):
         return len(self.tok(prompt, add_special_tokens=False)["input_ids"])
 
+    def _run_batch(self, batch_prompts):
+        enc = self.tok(batch_prompts, return_tensors="pt", padding=True,
+                       add_special_tokens=False).to(self.model.device)
+        with self.torch.no_grad():
+            out = self.model.generate(**enc, max_new_tokens=self.max_new, do_sample=False,
+                                      pad_token_id=self.tok.pad_token_id)
+        return enc, out
+
     def _generate_batch(self, batch_prompts):
-        """Generate for one batch; on out-of-memory, split the batch in half and retry."""
+        """Generate for one batch. On out-of-memory: free the failed attempt, split the batch in half and retry;
+        a single question that still does not fit is recorded as unanswered instead of crashing the run."""
         try:
-            enc = self.tok(batch_prompts, return_tensors="pt", padding=True,
-                           add_special_tokens=False).to(self.model.device)
-            with self.torch.no_grad():
-                out = self.model.generate(**enc, max_new_tokens=self.max_new, do_sample=False,
-                                          pad_token_id=self.tok.pad_token_id)
+            enc, out = self._run_batch(batch_prompts)
         except self.torch.cuda.OutOfMemoryError:
-            if len(batch_prompts) == 1:
-                raise
+            enc = out = None
+        if out is None:
+            # Retry only after leaving the except block: until then the exception's traceback keeps the failed
+            # attempt's GPU tensors alive, so every retry would run out of memory as well.
+            gc.collect()
             self.torch.cuda.empty_cache()
+            if len(batch_prompts) == 1:
+                self.oom_skipped += 1
+                print(f"  WARNING: one question does not fit in GPU memory - recorded as unanswered "
+                      f"({self.oom_skipped} so far)", flush=True)
+                return [("", self.n_tokens(batch_prompts[0]), 0)]
             half = len(batch_prompts) // 2
             return self._generate_batch(batch_prompts[:half]) + self._generate_batch(batch_prompts[half:])
         results = []
@@ -106,17 +128,32 @@ class HFRunner:
             results.append((self.tok.decode(gen, skip_special_tokens=True), n_in, n_out))
         return results
 
+    def plan_batches(self, lengths: list[int]) -> list[list[int]]:
+        """Group questions (shortest first) so each batch stays within the question cap and the token budget."""
+        batches, cur, cur_max = [], [], 0
+        for i in sorted(range(len(lengths)), key=lambda i: lengths[i]):
+            need = lengths[i] + self.max_new
+            if cur and (len(cur) + 1 > self.bs or (len(cur) + 1) * max(cur_max, need) > self.token_budget):
+                batches.append(cur)
+                cur, cur_max = [], 0
+            cur.append(i)
+            cur_max = max(cur_max, need)
+        if cur:
+            batches.append(cur)
+        return batches
+
     def generate(self, prompts):
-        order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
+        lengths = [self.n_tokens(p) for p in prompts]
+        batches = self.plan_batches(lengths)
         results = [None] * len(prompts)
-        t0 = time.perf_counter()
-        for s in range(0, len(order), self.bs):
-            idx = order[s:s + self.bs]
+        t0, done = time.perf_counter(), 0
+        for b, idx in enumerate(batches, 1):
             for i, r in zip(idx, self._generate_batch([prompts[i] for i in idx])):
                 results[i] = r
-            done = min(s + self.bs, len(order))
-            if len(order) > 1 and (done // self.bs) % 10 == 0 or done == len(order):
-                print(f"  {done}/{len(order)} questions  ({(time.perf_counter() - t0) / 60:.1f} min)", flush=True)
+            done += len(idx)
+            if len(prompts) > 1 and (b % 10 == 0 or b == len(batches)):
+                print(f"  {done}/{len(prompts)} questions, batch {b}/{len(batches)}  "
+                      f"({(time.perf_counter() - t0) / 60:.1f} min)", flush=True)
         return results
 
 
