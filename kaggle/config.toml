@@ -125,7 +125,7 @@ key_secret = "LLM_API_KEY"
 limit = 500
 price_in = 0.30                              # most commonly listed MiniMax list price, Oct 2026
 price_out = 1.20
-extra = "--concurrency 1 --max_tokens 8192"
+extra = "--concurrency 4 --max_tokens 8192"   # answers take ~20 s to several min; 4 at a time
 enabled = true
 
 [[api]]

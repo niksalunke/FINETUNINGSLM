@@ -362,9 +362,11 @@ class Runner:
             cmd.append("--short_prompt")  # must match how the model was trained
         return cmd
 
-    def run_parallel(self, jobs: dict[str, list[str]], gpus: bool = True, poll_seconds: int = 60) -> dict[str, int]:
+    def run_parallel(self, jobs: dict[str, list[str]], gpus: bool = True, poll_seconds: int = 60,
+                     backup_every_min: float | None = None) -> dict[str, int]:
         """Run jobs at the same time (with gpus=True, one per GPU and each sees only its own);
-        output goes to results/<job>.log and its end is printed when the job finishes."""
+        output goes to results/<job>.log and its end is printed when the job finishes.
+        With backup_every_min, results (incl. partial API answers) are uploaded to the Hub while jobs run."""
         procs = {}
         for n, (name, cmd) in enumerate(jobs.items()):
             print(f"$ [{f'GPU {n}' if gpus else name}] " + " ".join(shlex.quote(c) for c in cmd), flush=True)
@@ -374,8 +376,12 @@ class Runner:
             env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(n)} if gpus else dict(os.environ)
             procs[name] = (subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT), log)
         codes = {}
+        last_backup = time.time()
         while procs:
             time.sleep(poll_seconds)
+            if backup_every_min and time.time() - last_backup >= backup_every_min * 60:
+                self.backup_results("progress")
+                last_backup = time.time()
             for name, (proc, log) in list(procs.items()):
                 if proc.poll() is not None:
                     log.close()
@@ -425,7 +431,8 @@ class Runner:
         print(f"{len(contestants)} API models answer the same questions at the same time, up to {minutes:.0f} min "
               "(progress is in results/<name>.log)")
         self.run_parallel({c["name"]: self.api_cmd(c, c.get("limit", 500), c["name"], "results/preds")
-                           + ["--max_minutes", f"{minutes:.0f}"] for c in contestants}, gpus=False)
+                           + ["--max_minutes", f"{minutes:.0f}"] for c in contestants}, gpus=False,
+                          backup_every_min=20)  # a disconnect loses at most ~20 min of answers
         self.backup_results("API runs")
 
     def evaluate(self):
