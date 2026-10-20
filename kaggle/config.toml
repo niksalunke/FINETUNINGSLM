@@ -91,9 +91,10 @@ base_url = "https://inference.dahl.global/v1"
 model = "zai-org/GLM-5.3-Flash"
 limit = 500
 extra = "--concurrency 1 --max_tokens 4096"
-# USD per 1M tokens from the provider's pricing page -- uncomment and fill in so cost can be compared:
-# price_in = 0.10
-# price_out = 0.40
+# USD per 1M tokens at list price (what a business would pay, not free credits). GLM-5.3-Flash list price as
+# widely reported for Z.ai in Oct 2026 - confirm at docs.z.ai and adjust if it differs:
+price_in = 0.15
+price_out = 0.50
 
 # Claude flagship baseline (key: ANTHROPIC_API_KEY secret; skipped if the secret is not attached)
 [claude]
