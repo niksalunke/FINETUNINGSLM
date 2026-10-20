@@ -126,7 +126,7 @@ key_secret = "LLM_API_KEY"
 limit = 1663                                 # the full official test set; answers already saved are skipped
 price_in = 0.30                              # most commonly listed MiniMax list price, Oct 2026
 price_out = 1.20
-extra = "--concurrency 4 --max_tokens 32768 --request_timeout 900"   # ~20 s to many min per answer
+extra = "--concurrency 8 --max_tokens 32768 --request_timeout 900"   # 4 at a time gave a 7.5 s median
 enabled = true
 
 [[api]]
