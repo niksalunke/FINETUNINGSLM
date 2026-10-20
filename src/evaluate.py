@@ -38,6 +38,9 @@ def load_runs(preds_dir: Path) -> dict:
         name = meta_path.name[: -len(".meta.json")]
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         recs = [json.loads(l) for l in open(preds_dir / f"{name}.jsonl", encoding="utf-8")]
+        if not recs:  # e.g. an API model that answered nothing yet - it would empty the common view
+            print(f"skipping {name}: no answers yet")
+            continue
         runs[name] = {"meta": meta, "recs": {r["uid"]: r for r in recs}}
     return runs
 

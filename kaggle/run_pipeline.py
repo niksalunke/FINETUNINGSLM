@@ -137,32 +137,28 @@ class Runner:
     def merged(self) -> str:
         return f"{self.cfg['train']['out']}-merged"
 
-    def api_cmd(self, provider: str, sec: dict, limit: int, run: str, preds_dir: str) -> list[str]:
-        cmd = [PY, "src/infer_api.py", "--provider", provider, "--model", sec["model"],
+    def api_cmd(self, c: dict, limit: int, run: str, preds_dir: str) -> list[str]:
+        cmd = [PY, "src/infer_api.py", "--provider", c["provider"], "--model", c["model"],
                "--run", run, "--limit", str(limit), "--preds_dir", preds_dir]
-        if provider == "openai_compatible":
-            cmd += ["--base_url", sec["base_url"], "--api_key_env", "LLM_API_KEY"]
-        if "price_in" in sec and "price_out" in sec:
-            cmd += ["--price_in", str(sec["price_in"]), "--price_out", str(sec["price_out"])]
-        return cmd + shlex.split(sec.get("extra", ""))
+        if c["provider"] != "anthropic":
+            if c.get("base_url"):
+                cmd += ["--base_url", c["base_url"]]
+            cmd += ["--api_key_env", c.get("key_secret", "LLM_API_KEY")]
+        if "price_in" in c and "price_out" in c:
+            cmd += ["--price_in", str(c["price_in"]), "--price_out", str(c["price_out"])]
+        return cmd + shlex.split(c.get("extra", ""))
 
-    def llm_ready(self) -> bool:
-        sec = self.cfg.get("llm", {})
-        if not sec.get("enabled"):
-            print("LLM baseline disabled in config")
-            return False
-        if not os.environ.get("LLM_API_KEY"):
-            print("LLM_API_KEY secret not attached - skipping your LLM")
-            return False
-        return True
-
-    def claude_ready(self) -> bool:
-        if not self.cfg.get("claude", {}).get("enabled"):
-            return False
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            print("ANTHROPIC_API_KEY secret not attached - skipping the Claude baseline")
-            return False
-        return True
+    def contestants(self) -> list[dict]:
+        """Enabled [[api]] entries whose key secret is attached to this session."""
+        ready = []
+        for c in self.cfg.get("api", []):
+            if not c.get("enabled", True):
+                continue
+            if not os.environ.get(c["key_secret"]) and not self.dry:
+                print(f"{c['name']}: {c['key_secret']} secret not attached - skipped")
+                continue
+            ready.append(c)
+        return ready
 
     def train_args(self, out: str, override: dict | None = None) -> list[str]:
         t = {**self.cfg["train"], **(override or {})}
@@ -195,13 +191,14 @@ class Runner:
         self.sh([PY, "src/prepare_data.py", "--out", "data"])
 
     def llm_smoketest(self):
-        if not self.llm_ready():
-            return
-        sec = self.cfg["llm"]
-        # 3 questions, short waits: a busy provider must never hold up training.
-        # Separate folder so these answers never mix into the real comparison.
-        self.sh(self.api_cmd("openai_compatible", sec, 3, f"{sec['run']}_smoketest", "results/smoketest")
-                + ["--rate_limit_wait", "30", "--max_minutes", "5", "--request_timeout", "90"], check=False)
+        """3 questions per contestant with short waits: catches a wrong model id, URL or key in minutes.
+        Separate folder, so these answers never mix into the real comparison."""
+        (ROOT / "results").mkdir(exist_ok=True)
+        jobs = {f"{c['name']}_smoketest": self.api_cmd(c, 3, f"{c['name']}_smoketest", "results/smoketest")
+                + ["--rate_limit_wait", "30", "--max_minutes", "5", "--request_timeout", "90"]
+                for c in self.contestants()}
+        if jobs:
+            self.run_parallel(jobs, gpus=False, poll_seconds=15)
 
     def launch(self, args: list[str]):
         """Run train.py on every visible GPU (DDP via accelerate) -- the dry run and the real run use the same path."""
@@ -365,19 +362,20 @@ class Runner:
             cmd.append("--short_prompt")  # must match how the model was trained
         return cmd
 
-    def run_parallel(self, jobs: dict[str, list[str]]) -> dict[str, int]:
-        """One job per GPU at the same time (each sees only its own GPU); output goes to a log file per job."""
+    def run_parallel(self, jobs: dict[str, list[str]], gpus: bool = True, poll_seconds: int = 60) -> dict[str, int]:
+        """Run jobs at the same time (with gpus=True, one per GPU and each sees only its own);
+        output goes to results/<job>.log and its end is printed when the job finishes."""
         procs = {}
-        for gpu, (name, cmd) in enumerate(jobs.items()):
-            print(f"$ [GPU {gpu}] " + " ".join(shlex.quote(c) for c in cmd), flush=True)
+        for n, (name, cmd) in enumerate(jobs.items()):
+            print(f"$ [{f'GPU {n}' if gpus else name}] " + " ".join(shlex.quote(c) for c in cmd), flush=True)
             if self.dry:
                 continue
             log = open(ROOT / f"results/{name}.log", "w", encoding="utf-8")
-            env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}
+            env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(n)} if gpus else dict(os.environ)
             procs[name] = (subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT), log)
         codes = {}
         while procs:
-            time.sleep(60)
+            time.sleep(poll_seconds)
             for name, (proc, log) in list(procs.items()):
                 if proc.poll() is not None:
                     log.close()
@@ -413,20 +411,22 @@ class Runner:
         if not (self.train_done or self.hero_answered) and not self.dry:
             print("training not finished - API baselines wait, so they are only paid for once")
             return
-        # API runs get only the session time that is left (minus a few minutes for the report);
-        # unfinished questions are kept and continued on the next run.
-        for ready, provider, key in ((self.llm_ready, "openai_compatible", "llm"), (self.claude_ready, "anthropic", "claude")):
-            if not ready():
-                continue
-            minutes = self.minutes_left(reserve_minutes=10)
-            if minutes < 3 and not self.dry:
-                print(f"no session time left for {key} - run the notebook again to continue it")
-                continue
-            sec = self.cfg[key]
-            print(f"{key}: up to {minutes:.0f} min this session")
-            self.sh(self.api_cmd(provider, sec, sec["limit"], sec["run"], "results/preds")
-                    + ["--max_minutes", f"{minutes:.0f}"], check=False)
-            self.backup_results(sec["run"])
+        # All contestants run at the same time, each with the session time that is left (minus a few minutes
+        # for the report); unfinished questions are kept and continued on the next run.
+        contestants = self.contestants()
+        if not contestants:
+            print("no API contestants with an attached key - nothing to do")
+            return
+        minutes = self.minutes_left(reserve_minutes=15)
+        if minutes < 3 and not self.dry:
+            print("no session time left for the API runs - run the notebook again to continue them")
+            return
+        (ROOT / "results").mkdir(exist_ok=True)
+        print(f"{len(contestants)} API models answer the same questions at the same time, up to {minutes:.0f} min "
+              "(progress is in results/<name>.log)")
+        self.run_parallel({c["name"]: self.api_cmd(c, c.get("limit", 500), c["name"], "results/preds")
+                           + ["--max_minutes", f"{minutes:.0f}"] for c in contestants}, gpus=False)
+        self.backup_results("API runs")
 
     def evaluate(self):
         if not list((ROOT / "results/preds").glob("*.meta.json")) and not self.dry:

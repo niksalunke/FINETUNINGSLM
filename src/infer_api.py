@@ -196,9 +196,14 @@ def main():
                 print(f"  {k}/{len(futures)}")
     wall = time.perf_counter() - t0
 
-    records = [done[r["uid"]] for r in rows if r["uid"] in done]
+    attempted = [done[r["uid"]] for r in rows if r["uid"] in done]
+    failed = [r for r in attempted if str(r.get("error") or "").startswith("api_error")]
+    # Questions the API never answered (time limit, capacity, timeouts) are left out of the results instead of
+    # being scored as wrong; they stay in the .partial file and are retried on the next run. The report compares
+    # every model on the questions all of them answered.
+    records = [r for r in attempted if r not in failed]
     ok = [r for r in records if r.get("cost_usd") is not None]
-    api_errors = sum(1 for r in records if str(r.get("error") or "").startswith("api_error"))
+    api_errors = len(failed)
     mean_cost = sum(r["cost_usd"] for r in ok) / len(ok) if ok else None
     meta = {
         "kind": "api", "provider": args.provider, "model": args.model, "mode": "fewshot",
@@ -212,9 +217,10 @@ def main():
         **latency_stats([r.get("latency_s") for r in records]),
     }
     write_run(args.preds_dir, args.run, records, meta)
+    print(f"answered {len(records)}/{len(rows)} questions")
     if api_errors:
-        first = next(r["error"] for r in records if str(r.get("error") or "").startswith("api_error"))
-        print(f"{api_errors} requests failed; re-run the same command to retry them. First error:\n  {first}")
+        print(f"{api_errors} not answered yet; re-run the same command to retry them. First error:\n  "
+              f"{failed[0]['error']}")
     print({k: meta[k] for k in ("cost_usd_total", "cost_per_1m_questions_usd", "latency_p50_s")})
 
 

@@ -83,23 +83,56 @@ token_budget_finetuned = 16000
 token_budget_fewshot = 16000
 latency_n = 50          # single requests timed one by one for the latency column
 
-# Your OpenAI-compatible LLM (key: LLM_API_KEY secret)
-[llm]
-enabled = true
-run = "my_llm"
+# ---------------------------------------------------------------- API contestants
+# Every enabled entry answers the same fixed questions (limit) in the CPU-only run
+# (STAGES = "setup,data,api,evaluate"); all run at the same time. An entry whose key secret is not
+# attached is skipped. Prices: USD per 1M tokens at LIST price (what a business would pay, not free
+# credits) - confirm each on the provider's pricing page; without prices the report shows cost as unknown.
+# max_tokens is the same for every model (room for reasoning + the answer), so no one is cut short.
+# Active comparison: MiniMax-M2.7 only (the provider's main model line, known list price).
+# The others are kept switched off; set enabled = true to add one.
+
+[[api]]
+name = "glm_5_3_flash"                       # name in the report
+provider = "openai_compatible"
 base_url = "https://inference.dahl.global/v1"
 model = "zai-org/GLM-5.3-Flash"
+key_secret = "LLM_API_KEY"
 limit = 500
-extra = "--concurrency 1 --max_tokens 4096"
-# USD per 1M tokens at list price (what a business would pay, not free credits). GLM-5.3-Flash list price as
-# widely reported for Z.ai in Oct 2026 - confirm at docs.z.ai and adjust if it differs:
-price_in = 0.15
+price_in = 0.15                              # widely reported Z.ai list price, Oct 2026
 price_out = 0.50
+extra = "--concurrency 1 --max_tokens 8192"
+enabled = false
 
-# Claude flagship baseline (key: ANTHROPIC_API_KEY secret; skipped if the secret is not attached)
-[claude]
-enabled = true
-run = "claude_opus_5_5"
-model = "claude-opus-5-5"
+[[api]]
+name = "deepseek_v4_flash"
+provider = "openai_compatible"
+base_url = "https://inference.dahl.global/v1"
+model = "deepseek-ai/DeepSeek-V4-Flash-0731"  # check the exact id in your provider's model list
+key_secret = "LLM_API_KEY"
 limit = 500
-extra = ""
+# price_in = ...                             # confirm on DeepSeek's or your provider's pricing page
+# price_out = ...
+extra = "--concurrency 1 --max_tokens 8192"
+enabled = false
+
+[[api]]
+name = "minimax_m2_7"
+provider = "openai_compatible"
+base_url = "https://inference.dahl.global/v1"
+model = "MiniMaxAI/MiniMax-M2.7"
+key_secret = "LLM_API_KEY"
+limit = 500
+price_in = 0.30                              # most commonly listed MiniMax list price, Oct 2026
+price_out = 1.20
+extra = "--concurrency 1 --max_tokens 8192"
+enabled = true
+
+[[api]]
+name = "claude_opus_5_5"
+provider = "anthropic"
+model = "claude-opus-5-5"
+key_secret = "ANTHROPIC_API_KEY"
+limit = 500
+extra = ""                                   # list price is built into src/infer_api.py
+enabled = false
